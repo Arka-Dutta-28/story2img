@@ -12,8 +12,8 @@ Constraint Builder — constructs the final prompt string for image generation.
 ## Public interface
 
 * build_constraints(scene, character_descriptions, config) -> dict — structured layer (+ optional layout)
-* build_prompt_from_constraints(constraints, include_layout=True) -> str — collapse constraints to text
-* compress_prompt(constraints) -> str — short prompt for ControlNet + SDXL
+* build_prompt_from_constraints(constraints, include_layout=True) -> str — minimal text (names, action, setting; optional layout)
+* compress_prompt(constraints) -> str — minimal text for ControlNet + SDXL (no layout phrases)
 * build_prompt(scene, character_descriptions, style_prefix, style_suffix) -> str — legacy assembler
 
 Optional layout planning via config["layout"] and Groq (see generate_layout_with_llm); always falls back on failure.
@@ -309,22 +309,42 @@ Output format:
 
 def compress_prompt(constraints: dict) -> str:
     """
-    Short prompt for SDXL when ControlNet carries spatial layout: names, main action, setting only.
+    Minimal SDXL prompt when ControlNet carries layout: names (if not already in action),
+    first sentence of action, short setting. Hard-capped for tokenizer budget.
     """
     parts: list[str] = []
 
-    for char in constraints.get("characters", []):
-        if isinstance(char, dict) and char.get("name"):
-            parts.append(str(char["name"]))
+    char_names: list[str] = []
+    for c in constraints.get("characters", []):
+        if isinstance(c, dict) and c.get("name"):
+            char_names.append(str(c["name"]).strip())
 
-    actions = constraints.get("actions") or []
+    actions = constraints.get("actions", [])
+    action_line = ""
     if isinstance(actions, list) and actions:
-        parts.append(str(actions[0]))
+        action_line = str(actions[0]).split(".")[0].strip()
 
-    if constraints.get("setting"):
-        parts.append(str(constraints["setting"]))
+    action_lower = action_line.lower()
+    names_only = [n for n in char_names if n and n.lower() not in action_lower]
 
-    return ", ".join(parts)
+    if names_only:
+        parts.append(", ".join(names_only))
+
+    if action_line:
+        parts.append(action_line)
+
+    setting = constraints.get("setting")
+    if setting:
+        phrase = str(setting).split(".")[0].strip()
+        if phrase:
+            parts.append(phrase)
+
+    prompt = ", ".join(parts)
+    if len(prompt) > 200:
+        prompt = prompt[:200]
+
+    print("FINAL PROMPT LENGTH:", len(prompt))
+    return prompt
 
 
 def build_constraints(
@@ -438,43 +458,57 @@ def build_prompt_from_constraints(
     include_layout: bool = True,
 ) -> str:
     """
-    Convert structured constraints into a single prompt string.
-
-    Parameters
-    ----------
-    constraints : dict
-        Output of build_constraints().
-    include_layout : bool
-        If False, omit spatial layout phrases (e.g. when ControlNet carries layout).
-
-    Returns
-    -------
-    str
-        Comma-joined prompt text for the image generator.
+    Minimal comma-joined prompt: character names (only if not already in the action line),
+    first sentence of action, short setting; optional non-redundant layout prefixes.
+    No per-character description blocks, time, or mood.
     """
     parts: list[str] = []
 
-    for char in constraints["characters"]:
-        parts.append(f'{char["name"]}: {char["description"]}')
+    char_names: list[str] = []
+    for c in constraints.get("characters", []):
+        if isinstance(c, dict) and c.get("name"):
+            char_names.append(str(c["name"]).strip())
 
-    parts.extend(constraints["actions"])
+    actions = constraints.get("actions", [])
+    action_line = ""
+    if isinstance(actions, list) and actions:
+        action_line = str(actions[0]).split(".")[0].strip()
 
-    if constraints["setting"]:
-        parts.append(f'setting: {constraints["setting"]}')
-    if constraints["time"]:
-        parts.append(f'time: {constraints["time"]}')
-    if constraints["mood"]:
-        parts.append(f'mood: {constraints["mood"]}')
+    action_lower = action_line.lower()
+    names_only = [n for n in char_names if n and n.lower() not in action_lower]
 
     if include_layout:
         layout = constraints.get("layout") or {}
         layout_chars = layout.get("characters") if isinstance(layout, dict) else None
         if isinstance(layout_chars, list):
+            layout_frags: list[str] = []
             for c in layout_chars:
                 if isinstance(c, dict) and "name" in c and "position" in c and "depth" in c:
-                    parts.insert(0, f'{c["name"]} at {c["position"]} {c["depth"]}')
+                    nm = str(c["name"]).strip()
+                    if nm.lower() in action_lower:
+                        continue
+                    layout_frags.append(f'{nm} at {c["position"]} {c["depth"]}')
+            for frag in reversed(layout_frags):
+                parts.insert(0, frag)
 
-    return ", ".join(parts)
+    if names_only:
+        parts.append(", ".join(names_only))
+
+    if action_line:
+        parts.append(action_line)
+
+    setting = constraints.get("setting")
+    if setting:
+        phrase = str(setting).split(".")[0].strip()
+        if phrase:
+            parts.append(phrase)
+
+    prompt = ", ".join(parts)
+    if len(prompt) > 200:
+        prompt = prompt[:200]
+
+    print("FINAL PROMPT LENGTH:", len(prompt))
+    return prompt
 
 
 # --------------------------------------------------
