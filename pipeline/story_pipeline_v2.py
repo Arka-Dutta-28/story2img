@@ -40,6 +40,7 @@ from constraints.constraint_builder import (
     build_constraints,
     build_prompt,
     build_prompt_from_constraints,
+    compress_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ def run_pipeline_v2(
                    config["constraint_builder"]     — style_prefix, style_suffix
                    config["layout"]                   — optional LLM layout (constraint_builder)
                    config["controlnet"]               — optional ControlNet path (controlled_generator)
+                   config["prompt_cache"]             — optional reuse of prompt.txt in debug_output_dir
 
     Returns
     -------
@@ -200,42 +202,87 @@ def run_pipeline_v2(
         use_controlnet = bool(cn_cfg.get("enabled"))
 
         # -------------------------------
-        # Build prompt (structured constraints → text; fallback: legacy build_prompt)
-        # -------------------------------
-        constraints: Optional[dict[str, Any]] = None
-        try:
-            constraints = build_constraints(scene, char_descriptions, config)
-            prompt = build_prompt_from_constraints(
-                constraints,
-                include_layout=not use_controlnet,
-            )
-            if not str(prompt).strip():
-                raise ValueError("empty prompt from constraints")
-        except Exception as exc:
-            if use_controlnet:
-                raise ValueError(
-                    "ControlNet enabled but constraint path failed; layout is required."
-                ) from exc
-            prompt = build_prompt(
-                scene=scene,
-                character_descriptions=char_descriptions,
-                style_prefix=style_prefix,
-                style_suffix=style_suffix,
-            )
-
-        print("CONSTRAINTS:", constraints)
-        print("PROMPT:", prompt)
-
-        _analyze_prompt(prompt, scene_id)
-
-        # -------------------------------
-        # Debug scene directory (prompt, control map, candidates)
+        # Debug scene directory (needed early for optional prompt cache read/write)
         # -------------------------------
         scene_dir = config.get("debug_output_dir", None)
         scene_path: Optional[Path] = None
         if scene_dir:
             scene_path = Path(scene_dir) / f"scene_{scene_id:02d}"
             scene_path.mkdir(parents=True, exist_ok=True)
+
+        prompt_cache_enabled = bool((config.get("prompt_cache") or {}).get("enabled", False))
+        prompt_file: Optional[Path] = None
+        if scene_path is not None:
+            prompt_file = scene_path / "prompt.txt"
+
+        # -------------------------------
+        # Build prompt (structured constraints → text; fallback: legacy build_prompt)
+        # -------------------------------
+        constraints: Optional[dict[str, Any]] = None
+        cached_prompt_text: Optional[str] = None
+        if prompt_cache_enabled and prompt_file is not None and prompt_file.is_file():
+            try:
+                cached_prompt_text = prompt_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                cached_prompt_text = None
+
+        if (
+            prompt_cache_enabled
+            and prompt_file is not None
+            and cached_prompt_text
+        ):
+            print(f"[SCENE {scene_id}] PROMPT CACHE HIT")
+            prompt = cached_prompt_text
+            if use_controlnet:
+                try:
+                    constraints = build_constraints(scene, char_descriptions, config)
+                    if not str(prompt).strip():
+                        raise ValueError("empty cached prompt")
+                except Exception as exc:
+                    raise ValueError(
+                        "ControlNet enabled but constraint rebuild failed (prompt cache hit)."
+                    ) from exc
+            else:
+                constraints = None
+        else:
+            try:
+                constraints = build_constraints(scene, char_descriptions, config)
+                if use_controlnet:
+                    prompt = compress_prompt(constraints)
+                    if len(prompt) > 200:
+                        prompt = prompt[:200]
+                    print("PROMPT COMPRESSED:", prompt)
+                else:
+                    prompt = build_prompt_from_constraints(
+                        constraints,
+                        include_layout=True,
+                    )
+                if not str(prompt).strip():
+                    raise ValueError("empty prompt from constraints")
+            except Exception as exc:
+                if use_controlnet:
+                    raise ValueError(
+                        "ControlNet enabled but constraint path failed; layout is required."
+                    ) from exc
+                constraints = None
+                prompt = build_prompt(
+                    scene=scene,
+                    character_descriptions=char_descriptions,
+                    style_prefix=style_prefix,
+                    style_suffix=style_suffix,
+                )
+
+            if prompt_cache_enabled and prompt_file is not None:
+                try:
+                    prompt_file.write_text(prompt, encoding="utf-8")
+                except OSError as wexc:
+                    logger.warning("prompt cache save failed: %s", wexc)
+                print(f"[SCENE {scene_id}] PROMPT GENERATED")
+
+        print("CONSTRAINTS:", constraints)
+        print("PROMPT:", prompt)
+
+        _analyze_prompt(prompt, scene_id)
 
         # -------------------------------
         # Generate candidates (optional ControlNet + layout control image)

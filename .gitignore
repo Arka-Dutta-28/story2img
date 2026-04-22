@@ -17,4 +17,7 @@ logs/
 # Image run folders from pipeline sanity checks
 outputs/
 
+# Runtime caches (layout + text embeddings)
+cache/
+
 *.md

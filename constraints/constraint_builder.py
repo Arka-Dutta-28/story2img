@@ -13,17 +13,22 @@ Constraint Builder — constructs the final prompt string for image generation.
 
 * build_constraints(scene, character_descriptions, config) -> dict — structured layer (+ optional layout)
 * build_prompt_from_constraints(constraints, include_layout=True) -> str — collapse constraints to text
+* compress_prompt(constraints) -> str — short prompt for ControlNet + SDXL
 * build_prompt(scene, character_descriptions, style_prefix, style_suffix) -> str — legacy assembler
 
 Optional layout planning via config["layout"] and Groq (see generate_layout_with_llm); always falls back on failure.
 No negative prompts. No complex prompt engineering beyond layout JSON.
 """
 
+import hashlib
 import json
 import logging
 import re
 from pathlib import Path
 from typing import Any, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LAYOUT_CACHE_PATH = REPO_ROOT / "cache" / "layout_cache.json"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -52,6 +57,33 @@ logger.addHandler(file_handler)
 
 def _truncate(text: str, max_words: int):
     return " ".join(text.split()[:max_words])
+
+
+def _load_layout_cache() -> dict[str, Any]:
+    try:
+        LAYOUT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LAYOUT_CACHE_PATH.is_file():
+            with LAYOUT_CACHE_PATH.open(encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("layout cache load failed: %s", exc)
+    return {}
+
+
+def _save_layout_cache(cache: dict[str, Any]) -> None:
+    try:
+        LAYOUT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LAYOUT_CACHE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as exc:
+        logger.warning("layout cache save failed: %s", exc)
+
+
+def _layout_cache_key(scene: dict, character_names: list[str]) -> str:
+    desc = (scene.get("description") or "").strip()
+    key_str = desc + str(sorted(character_names))
+    return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
 
 # Last Groq layout response text for mandatory debug logging (sequential pipeline only).
@@ -275,6 +307,26 @@ Output format:
 # --------------------------------------------------
 
 
+def compress_prompt(constraints: dict) -> str:
+    """
+    Short prompt for SDXL when ControlNet carries spatial layout: names, main action, setting only.
+    """
+    parts: list[str] = []
+
+    for char in constraints.get("characters", []):
+        if isinstance(char, dict) and char.get("name"):
+            parts.append(str(char["name"]))
+
+    actions = constraints.get("actions") or []
+    if isinstance(actions, list) and actions:
+        parts.append(str(actions[0]))
+
+    if constraints.get("setting"):
+        parts.append(str(constraints["setting"]))
+
+    return ", ".join(parts)
+
+
 def build_constraints(
     scene: dict,
     character_descriptions: dict[str, str],
@@ -324,21 +376,53 @@ def build_constraints(
     character_names = [c["name"] for c in constraints["characters"]]
 
     llm_raw: Optional[str] = None
+    from_cache = False
+
     if layout_cfg.get("use_llm_layout"):
-        layout_candidate = generate_layout_with_llm(constraints, cfg)
-        llm_raw = _LAST_GROQ_LAYOUT_RESPONSE_TEXT
-        if layout_candidate is not None and validate_layout(layout_candidate, character_names):
-            layout = layout_candidate
+        layout_cache = _load_layout_cache()
+        cache_key = _layout_cache_key(scene, character_names)
+        layout: dict[str, Any]
+
+        if cache_key in layout_cache:
+            cached_layout = layout_cache[cache_key]
+            if isinstance(cached_layout, dict) and validate_layout(cached_layout, character_names):
+                print("CACHE HIT: layout")
+                layout = cached_layout
+                from_cache = True
+            else:
+                layout_cache.pop(cache_key, None)
+                _save_layout_cache(layout_cache)
+                layout_candidate = generate_layout_with_llm(constraints, cfg)
+                llm_raw = _LAST_GROQ_LAYOUT_RESPONSE_TEXT
+                if layout_candidate is not None and validate_layout(layout_candidate, character_names):
+                    layout = layout_candidate
+                    layout_cache[cache_key] = layout
+                    _save_layout_cache(layout_cache)
+                else:
+                    logger.warning(
+                        "layout planner: invalid JSON, validation failed, or LLM error — using fallback_layout"
+                    )
+                    layout = fallback_layout(character_names)
         else:
-            logger.warning(
-                "layout planner: invalid JSON, validation failed, or LLM error — using fallback_layout"
-            )
-            layout = fallback_layout(character_names)
+            layout_candidate = generate_layout_with_llm(constraints, cfg)
+            llm_raw = _LAST_GROQ_LAYOUT_RESPONSE_TEXT
+            if layout_candidate is not None and validate_layout(layout_candidate, character_names):
+                layout = layout_candidate
+                layout_cache[cache_key] = layout
+                _save_layout_cache(layout_cache)
+            else:
+                logger.warning(
+                    "layout planner: invalid JSON, validation failed, or LLM error — using fallback_layout"
+                )
+                layout = fallback_layout(character_names)
     else:
         layout = fallback_layout(character_names)
 
     if layout_cfg.get("use_llm_layout"):
-        print("LLM RAW:", llm_raw if llm_raw is not None else "(no response)")
+        if from_cache:
+            print("LLM RAW:", "(skipped; layout from cache)")
+        else:
+            print("LLM RAW:", llm_raw if llm_raw is not None else "(no response)")
     else:
         print("LLM RAW:", "(skipped; use_llm_layout is false)")
 

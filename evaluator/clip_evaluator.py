@@ -19,14 +19,20 @@ Public interface
 No pipeline logic. No memory logic. No generator logic.
 """
 
+import hashlib
+import json
 import logging
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EMBEDDING_CACHE_PATH = REPO_ROOT / "cache" / "embedding_cache.json"
 
 # ---------------------------------------------------------------------------
 # Model singleton
@@ -37,8 +43,41 @@ _preprocess  = None
 _tokenizer   = None
 _device: Optional[str] = None
 
+_embedding_json_cache: Optional[dict[str, Any]] = None
 
-def _load_model(model_name: str = "ViT-L-14", pretrained: str = "openai"):
+
+def _load_embedding_cache() -> dict[str, Any]:
+    global _embedding_json_cache
+    if _embedding_json_cache is not None:
+        return _embedding_json_cache
+    try:
+        EMBEDDING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if EMBEDDING_CACHE_PATH.is_file():
+            with EMBEDDING_CACHE_PATH.open(encoding="utf-8") as f:
+                data = json.load(f)
+                _embedding_json_cache = data if isinstance(data, dict) else {}
+        else:
+            _embedding_json_cache = {}
+    except Exception as exc:
+        logger.warning("embedding cache load failed: %s", exc)
+        _embedding_json_cache = {}
+    return _embedding_json_cache
+
+
+def _save_embedding_cache(cache: dict[str, Any]) -> None:
+    try:
+        EMBEDDING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with EMBEDDING_CACHE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as exc:
+        logger.warning("embedding cache save failed: %s", exc)
+
+
+def _embedding_cache_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_model(model_name: str = "ViT-L-14", pretrained: str = "laion2b_s32b_b82k"):
     """
     Load (or return cached) an OpenCLIP model, preprocessor, and tokenizer.
 
@@ -47,7 +86,7 @@ def _load_model(model_name: str = "ViT-L-14", pretrained: str = "openai"):
     Parameters
     ----------
     model_name : OpenCLIP architecture name. Default: "ViT-L-14".
-    pretrained : Pretrained weights tag.     Default: "openai".
+    pretrained : Pretrained weights tag.     Default: "laion2b_s32b_b82k".
 
     Returns
     -------
@@ -119,17 +158,9 @@ def _encode_image(img: Image.Image) -> torch.Tensor:
     return embedding.squeeze(0).cpu()                   # (D,)
 
 
-def _encode_text(text: str) -> torch.Tensor:
+def _encode_text_uncached(text: str) -> torch.Tensor:
     """
-    Encode a text string into a normalised CLIP embedding.
-
-    Parameters
-    ----------
-    text : Input string (will be truncated to model context length if needed).
-
-    Returns
-    -------
-    Normalised 1-D float tensor on CPU.
+    Encode a text string into a normalised CLIP embedding (no disk cache).
     """
     model, _, tokenizer, device = _load_model()
 
@@ -140,6 +171,38 @@ def _encode_text(text: str) -> torch.Tensor:
 
     embedding = F.normalize(embedding, dim=-1)
     return embedding.squeeze(0).cpu()                   # (D,)
+
+
+def get_text_embedding(text: str) -> torch.Tensor:
+    """
+    Text embedding with on-disk JSON cache (keyed by SHA-256 of text).
+    """
+    key = _embedding_cache_key(text)
+    cache = _load_embedding_cache()
+    if key in cache:
+        print("CACHE HIT: embedding")
+        vec = cache[key]
+        return torch.tensor(vec, dtype=torch.float32)
+
+    emb = _encode_text_uncached(text)
+    cache[key] = emb.tolist()
+    _save_embedding_cache(cache)
+    return emb
+
+
+def _encode_text(text: str) -> torch.Tensor:
+    """
+    Encode a text string into a normalised CLIP embedding (cached across runs).
+
+    Parameters
+    ----------
+    text : Input string (will be truncated to model context length if needed).
+
+    Returns
+    -------
+    Normalised 1-D float tensor on CPU.
+    """
+    return get_text_embedding(text)
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
