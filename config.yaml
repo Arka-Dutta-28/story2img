@@ -1,0 +1,90 @@
+# =============================================================================
+# story2images — Master Configuration
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# LLM (Parser)
+# -----------------------------------------------------------------------------
+llm:
+  provider: "gemini"                  # "gemini" | "groq" | "nvidia"
+  gemini:
+    model: "gemini-2.5-flash"
+    temperature: 0
+    max_output_tokens: 8192
+  groq:
+    model: "openai/gpt-oss-120b"
+    temperature: 0
+    max_tokens: 8192
+  nvidia:
+    model: "deepseek-ai/deepseek-v3.2"   # "deepseek-ai/deepseek-v3.2" , "minimaxai/minimax-m2.7" , "z-ai/glm4.7"
+    temperature: 0
+    max_tokens: 8192
+    top_p: 0.95
+
+# -----------------------------------------------------------------------------
+# Image Generation (SDXL)
+# -----------------------------------------------------------------------------
+generation:
+  model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+  num_candidates: 3                    # N candidates per scene (owned by config)
+  steps: 30 
+  guidance_scale: 7.5
+  height: 1024
+  width: 1024
+  seed_strategy: "incremental"        # "incremental" | "random"
+  base_seed: 42
+
+# -----------------------------------------------------------------------------
+# ControlNet (optional; SDXL + layout-derived control image)
+# -----------------------------------------------------------------------------
+controlnet:
+  enabled: false
+  model_id: "diffusers/controlnet-canny-sdxl-1.0"    # "diffusers/controlnet-depth-sdxl-1.0"
+  conditioning_scale: 0.5
+  save_debug_control: true
+  # Switch to segmentation ControlNet
+# -----------------------------------------------------------------------------
+# Evaluator (CLIP)
+# Weights must sum to 1.0
+# -----------------------------------------------------------------------------
+evaluator:
+  clip_model: "openai/clip-vit-base-patch32"
+  weights:
+    w_align: 0.5             # w_align  — image ↔ scene text
+    w_identity: 0.5         # w_identity — image ↔ reference image
+    w_temporal: 0           # w_temporal — image ↔ previous selected image
+
+# -----------------------------------------------------------------------------
+# Memory Manager
+# -----------------------------------------------------------------------------
+memory:
+  max_characters: 10                  # max distinct characters tracked
+
+# -----------------------------------------------------------------------------
+# Constraint Builder
+# -----------------------------------------------------------------------------
+constraint_builder:
+  style_prefix: "cinematic, highly detailed, concept art,"
+  style_suffix: "sharp focus, dramatic lighting"
+
+# -----------------------------------------------------------------------------
+# Layout planner (optional Groq LLM; safe fallback if disabled or on failure)
+# -----------------------------------------------------------------------------
+layout:
+  use_llm_layout: true
+  model: "openai/gpt-oss-120b"
+  temperature: 0.0
+  max_tokens: 512
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  output_dir: "logs"
+  save_all_candidates: true
+  save_selected: true
+  log_scores: true
+  log_prompts: true
+  log_memory_state: true
+  image_format: "png"
+

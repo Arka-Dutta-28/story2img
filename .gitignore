@@ -1,0 +1,20 @@
+# API keys and local overrides (present in this repo)
+.env
+
+# Bytecode when you run scripts from the repo root
+__pycache__/
+*.py[cod]
+
+# Virtual environment used here (see .venv in project root)
+.venv/
+
+# JetBrains — you already had this entry
+.idea/
+
+# Written at runtime: constraint_builder + pipeline sanity scripts (config logging.output_dir)
+logs/
+
+# Image run folders from pipeline sanity checks
+outputs/
+
+*.md
