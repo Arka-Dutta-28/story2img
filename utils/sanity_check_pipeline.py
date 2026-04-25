@@ -7,36 +7,51 @@ from llm import build_llm_client
 
 
 def run():
+    """
+    Parse a hard-coded story and run the Phase-5 pipeline without memory.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Loads ``config.yaml``, builds ``StoryParser``, saves selected images to
+    ``outputs/pipeline_scene_*.png``, prints condensed log summaries.
+
+    Edge cases
+    ----------
+    Requires working LLM and image generation backends; uses relative paths from
+    the current working directory.
+    """
     print("=== Full Pipeline Sanity Check ===")
 
-    # Load config
     with open("config.yaml") as f:
         config = yaml.safe_load(f)
 
-    # Sample story
     story = """
     A knight walks through a dark forest at night. He carries a glowing sword.
     He reaches a river where mist rises. A shadow moves across the water.
     He prepares to fight as the moon shines above.
     """
 
-    # Step 1: Parse
     llm_client = build_llm_client(config["llm"])
     parser = StoryParser(llm_client)
     parsed = parser.parse(story)
 
     print(f"\nParsed {len(parsed.scenes)} scenes")
 
-    # Step 2: Run pipeline
     result = run_pipeline(parsed.scenes, config)
 
     images = result["images"]
     logs = result["logs"]
 
-    # Ensure outputs folder exists
     os.makedirs("outputs", exist_ok=True)
 
-    # Save images
     for i, img in enumerate(images):
         path = f"outputs/pipeline_scene_{i}.png"
         img.save(path)

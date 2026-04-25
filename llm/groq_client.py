@@ -41,6 +41,39 @@ class GroqClient(LLMBase):
         max_tokens: int = 2048,
         api_key: Optional[str] = None,
     ) -> None:
+        """
+        Initialise the Groq SDK client with API credentials.
+
+        Parameters
+        ----------
+        model : str, optional
+            Groq model id (default ``llama3-8b-8192``).
+        temperature : float, optional
+            Stored on ``LLMBase`` and used in chat completion requests.
+        max_tokens : int, optional
+            Maximum completion tokens for ``complete``.
+        api_key : str or None, optional
+            If ``None``, reads ``GROQ_API_KEY`` from the environment.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Constructs ``self._client`` as ``Groq(api_key=...)``.
+
+        Raises
+        ------
+        EnvironmentError
+            If no API key is resolved.
+        ImportError
+            If the ``groq`` package is missing.
+
+        Edge cases
+        ----------
+        Does not verify the model string against Groq's catalog until request time.
+        """
         super().__init__(model=model, temperature=temperature, max_tokens=max_tokens)
 
         resolved_key = api_key or os.environ.get("GROQ_API_KEY")
@@ -51,7 +84,7 @@ class GroqClient(LLMBase):
             )
 
         try:
-            from groq import Groq  # type: ignore
+            from groq import Groq
         except ImportError as exc:
             raise ImportError(
                 "groq is not installed. "
@@ -68,19 +101,35 @@ class GroqClient(LLMBase):
         system_prompt: Optional[str] = None,
     ) -> LLMResponse:
         """
-        Send a prompt to Groq and return a standardised LLMResponse.
-
-        Groq's API is OpenAI-compatible and supports distinct system
-        and user roles natively.
+        Invoke Groq chat completions with optional system and user messages.
 
         Parameters
         ----------
-        prompt        : User-turn prompt text.
-        system_prompt : Optional system instruction.
+        prompt : str
+            User role content.
+        system_prompt : str or None, optional
+            If set, sent as a separate system message before the user message.
 
         Returns
         -------
         LLMResponse
+            Text from the first choice, usage token counts when present, raw SDK
+            response in ``raw``.
+
+        Notes
+        -----
+        Builds ``messages`` list, calls ``chat.completions.create`` with
+        ``temperature`` and ``max_tokens`` from ``LLMBase``.
+
+        Raises
+        ------
+        RuntimeError
+            If the API call raises.
+
+        Edge cases
+        ----------
+        Assumes at least one choice exists on success; provider behavior defines
+        content shape.
         """
         messages = []
 

@@ -1,11 +1,9 @@
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,6 +22,27 @@ LOG_PATH    = PROJECT_ROOT / "logs" / "pipeline_sanity_checks.json"
 
 
 def _load_stories():
+    """
+    Load all non-empty ``*.txt`` stories from ``data/test_stories``.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    list[dict[str, str]]
+        Dicts with keys ``id`` (stem) and ``text`` (stripped contents).
+
+    Notes
+    -----
+    Exits the process with code ``1`` if no text files are found.
+
+    Edge cases
+    ----------
+    Calls ``sys.exit`` on empty discovery; does not validate story encoding
+    beyond UTF-8 read.
+    """
     txt_files = sorted(STORIES_DIR.glob("*.txt"))
     if not txt_files:
         print("No stories found.")
@@ -40,6 +59,27 @@ def _load_stories():
 
 
 def run():
+    """
+    Batch-parse stories and run Phase-5 ``run_pipeline`` with JSON run logging.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Writes per-story PNGs under ``outputs/pipeline_runs/<story_id>/`` and
+    aggregates pass/fail metadata to ``logs/pipeline_sanity_checks.json``.
+
+    Edge cases
+    ----------
+    Catches ``Exception`` per story to continue the batch; prints emoji status
+    markers to stdout on success/failure.
+    """
     print("\n=== FULL PIPELINE SANITY CHECK ===")
 
     with open(CONFIG_PATH) as f:
@@ -66,7 +106,6 @@ def run():
             story_out_dir = OUTPUT_DIR / story["id"]
             story_out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save images
             for i, img in enumerate(pipeline_result["images"]):
                 img_path = story_out_dir / f"scene_{i}.png"
                 img.save(img_path)
@@ -94,7 +133,6 @@ def run():
 
             print(f"  ❌ Failed: {e}")
 
-    # Save log
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     log_payload = {

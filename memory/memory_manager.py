@@ -163,18 +163,27 @@ class MemoryManager:
         self, characters: list[str]
     ) -> dict[str, str]:
         """
-        Return stored descriptions for the requested characters.
-
-        Only characters that have an existing entry with a non-empty description
-        are included. Missing or description-less characters are silently skipped.
+        Collect non-empty stored descriptions for the given names.
 
         Parameters
         ----------
-        characters : List of character names to look up.
+        characters : list[str]
+            Names to query in iteration order.
 
         Returns
         -------
-        Mapping of character_name -> description string for those that exist.
+        dict[str, str]
+            Entries where ``entry.get("description")`` is truthy.
+
+        Notes
+        -----
+        Skips missing names or empty descriptions with debug logs; ends with
+        info count line.
+
+        Edge cases
+        ----------
+        Duplicate names in input would duplicate work but preserve last write in
+        the result dict.
         """
         result: dict[str, str] = {}
 
@@ -199,12 +208,72 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        """Return the number of characters currently tracked."""
+        """
+        Return the count of character keys in the internal store.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        int
+            ``len(self._store)``.
+
+        Notes
+        -----
+        O(1) delegation to builtin ``len`` on the mapping.
+
+        Edge cases
+        ----------
+        Empty manager returns ``0``.
+        """
         return len(self._store)
 
     def __repr__(self) -> str:
+        """
+        Render a concise representation listing tracked character names.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        str
+            ``MemoryManager(characters=[...])`` with current keys.
+
+        Notes
+        -----
+        Copies keys to a list for display order.
+
+        Edge cases
+        ----------
+        Large numbers of names produce a long single-line string.
+        """
         names = list(self._store.keys())
         return f"MemoryManager(characters={names})"
 
     def has_character(self, name: str) -> bool:
+        """
+        Report whether ``name`` exists in the memory store.
+
+        Parameters
+        ----------
+        name : str
+            Character name key.
+
+        Returns
+        -------
+        bool
+            ``True`` if ``name in self._store``.
+
+        Notes
+        -----
+        Membership test only; does not validate image or description presence.
+
+        Edge cases
+        ----------
+        Empty string is a valid key if inserted by callers.
+        """
         return name in self._store

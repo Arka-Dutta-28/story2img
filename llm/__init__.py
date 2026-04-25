@@ -17,19 +17,35 @@ from typing import Any, Optional
 
 def build_llm_client(llm_config: dict[str, Any]) -> LLMBase:
     """
-    Instantiate the correct LLM client from the `llm` section of config.yaml.
+    Construct a concrete ``LLMBase`` implementation from a config mapping.
 
     Parameters
     ----------
-    llm_config : The parsed `llm:` block from config.yaml.
+    llm_config : dict[str, Any]
+        The ``llm`` section from ``config.yaml``. Must include ``provider`` and
+        the matching nested block (``gemini``, ``groq``, or ``nvidia``).
 
     Returns
     -------
-    LLMBase — GeminiClient, GroqClient, or NvidiaClient.
+    LLMBase
+        ``GeminiClient``, ``GroqClient``, or ``NvidiaClient`` instance.
+
+    Notes
+    -----
+    Dispatches on ``llm_config["provider"]`` (case-insensitive). For NVIDIA,
+    ``top_p`` may be ``None`` and is passed through as optional. ``base_url``
+    defaults to the integrate API host when omitted.
 
     Raises
     ------
-    ValueError if the provider is not recognised.
+    ValueError
+        If ``provider`` is not one of the supported strings.
+
+    Edge cases
+    ----------
+    Unknown ``provider`` raises with a message listing supported values.
+    Missing nested keys required by each client constructor will raise from
+    that client's ``__init__``.
     """
     provider = llm_config.get("provider", "").lower()
 

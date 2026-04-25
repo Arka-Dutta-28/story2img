@@ -56,10 +56,53 @@ logger.addHandler(file_handler)
 # --------------------------------------------------
 
 def _truncate(text: str, max_words: int):
+    """
+    Return the first ``max_words`` whitespace-separated tokens of ``text``.
+
+    Parameters
+    ----------
+    text : str
+        Source string split with ``str.split()``.
+    max_words : int
+        Upper bound on token count (slice length).
+
+    Returns
+    -------
+    str
+        Space-joined prefix of tokens; empty string if ``text`` has no words.
+
+    Notes
+    -----
+    Does not normalise whitespace beyond ``split`` behaviour.
+
+    Edge cases
+    ----------
+    ``max_words`` larger than token count returns all tokens.
+    """
     return " ".join(text.split()[:max_words])
 
 
 def _load_layout_cache() -> dict[str, Any]:
+    """
+    Read the layout JSON cache from disk or return an empty dict.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    dict[str, Any]
+        Parsed object when root is a dict; otherwise ``{}``.
+
+    Notes
+    -----
+    Uses ``LAYOUT_CACHE_PATH``; ensures parent directory exists on read attempt.
+
+    Edge cases
+    ----------
+    Logs warning and returns ``{}`` on IO/JSON errors.
+    """
     try:
         LAYOUT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         if LAYOUT_CACHE_PATH.is_file():
@@ -72,6 +115,26 @@ def _load_layout_cache() -> dict[str, Any]:
 
 
 def _save_layout_cache(cache: dict[str, Any]) -> None:
+    """
+    Write ``cache`` to ``LAYOUT_CACHE_PATH`` as formatted JSON.
+
+    Parameters
+    ----------
+    cache : dict[str, Any]
+        Serializable mapping to persist.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Creates parent directories as needed.
+
+    Edge cases
+    ----------
+    Logs warning on failure without raising.
+    """
     try:
         LAYOUT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with LAYOUT_CACHE_PATH.open("w", encoding="utf-8") as f:
@@ -81,6 +144,30 @@ def _save_layout_cache(cache: dict[str, Any]) -> None:
 
 
 def _layout_cache_key(scene: dict, character_names: list[str]) -> str:
+    """
+    Build a deterministic SHA-256 key from scene description and character names.
+
+    Parameters
+    ----------
+    scene : dict
+        Uses ``scene.get("description")`` stripped or empty string.
+    character_names : list[str]
+        Sorted when stringified for stability.
+
+    Returns
+    -------
+    str
+        Hex digest of UTF-8 encoded concatenation.
+
+    Notes
+    -----
+    Concatenates description text with ``str(sorted(character_names))``.
+
+    Edge cases
+    ----------
+    Same description with different name orderings still collide only if sorted
+    lists match.
+    """
     desc = (scene.get("description") or "").strip()
     key_str = desc + str(sorted(character_names))
     return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
@@ -91,7 +178,28 @@ _LAST_GROQ_LAYOUT_RESPONSE_TEXT: Optional[str] = None
 
 
 def _parse_strict_layout_json(text: str) -> Optional[dict[str, Any]]:
-    """Parse LLM output into a dict; return None if not valid JSON object."""
+    """
+    Parse model text into a JSON object dict when possible.
+
+    Parameters
+    ----------
+    text : str
+        Raw LLM output possibly containing extra prose.
+
+    Returns
+    -------
+    dict[str, Any] or None
+        Parsed dict if root JSON is an object; else ``None``.
+
+    Notes
+    -----
+    First tries ``json.loads`` on stripped text; on failure searches for a
+    ``{...}`` substring and parses that.
+
+    Edge cases
+    ----------
+    Returns ``None`` for empty input, non-object JSON, or unparseable braces.
+    """
     if not text or not text.strip():
         return None
     s = text.strip()
@@ -111,6 +219,32 @@ def _parse_strict_layout_json(text: str) -> Optional[dict[str, Any]]:
 
 
 def validate_layout(layout: Any, character_names: list[str]) -> bool:
+    """
+    Check structural and naming constraints for a layout dict.
+
+    Parameters
+    ----------
+    layout : Any
+        Candidate layout object.
+    character_names : list[str]
+        Expected multiset of character names for the scene.
+
+    Returns
+    -------
+    bool
+        ``True`` if ``layout`` matches schema and names; else ``False``.
+
+    Notes
+    -----
+    Requires dict with ``characters`` list length equal to
+    ``len(character_names)``, exact set equality of names, each entry dict with
+    allowed ``position`` and ``depth`` values.
+
+    Edge cases
+    ----------
+    Returns ``False`` on type mismatches or duplicate handling is implicit in set
+    comparison of names.
+    """
     VALID_POS = {"left", "center", "right"}
     VALID_DEPTH = {"foreground", "midground", "background"}
 
@@ -146,6 +280,27 @@ def validate_layout(layout: Any, character_names: list[str]) -> bool:
 
 
 def fallback_layout(character_names: list[str]) -> dict[str, Any]:
+    """
+    Construct a deterministic default layout cycling positions and depths.
+
+    Parameters
+    ----------
+    character_names : list[str]
+        Names placed in input order.
+
+    Returns
+    -------
+    dict[str, Any]
+        ``{"characters": [{"name", "position", "depth"}, ...]}``.
+
+    Notes
+    -----
+    Cycles ``positions`` and ``depths`` by index modulo list length.
+
+    Edge cases
+    ----------
+    Empty input yields ``{"characters": []}``.
+    """
     positions = ["center", "left", "right"]
     depths = ["foreground", "midground", "background"]
 
@@ -166,9 +321,31 @@ def fallback_layout(character_names: list[str]) -> dict[str, Any]:
 
 def generate_layout_with_llm(constraints: dict, config: dict) -> Optional[dict[str, Any]]:
     """
-    Calls Groq LLM to generate layout.
-    Returns parsed layout dict OR None if failure.
-    Never raises.
+    Optionally query Groq for a JSON layout plan.
+
+    Parameters
+    ----------
+    constraints : dict
+        Structured constraints; reads ``characters`` and ``actions``.
+    config : dict
+        Master config; uses ``config.get("layout")`` for flags and Groq params.
+
+    Returns
+    -------
+    dict[str, Any] or None
+        Parsed layout dict on success; ``None`` on disabled feature, import
+        errors, API errors, or invalid JSON.
+
+    Notes
+    -----
+    Sets module global ``_LAST_GROQ_LAYOUT_RESPONSE_TEXT`` to raw text or
+    ``None``. Instantiates ``GroqClient`` from layout config when
+    ``use_llm_layout`` is true.
+
+    Edge cases
+    ----------
+    Swallows broad ``Exception`` and returns ``None``. Returns ``None`` when
+    ``use_llm_layout`` is false or Groq import fails.
     """
     global _LAST_GROQ_LAYOUT_RESPONSE_TEXT
     _LAST_GROQ_LAYOUT_RESPONSE_TEXT = None
@@ -309,8 +486,28 @@ Output format:
 
 def compress_prompt(constraints: dict) -> str:
     """
-    Minimal SDXL prompt when ControlNet carries layout: names (if not already in action),
-    first sentence of action, short setting. Hard-capped for tokenizer budget.
+    Build a short comma-joined prompt for ControlNet-conditioned generation.
+
+    Parameters
+    ----------
+    constraints : dict
+        Structured constraints with ``characters``, ``actions``, ``setting``.
+
+    Returns
+    -------
+    str
+        Prompt of joined fragments, truncated to 200 characters when longer.
+
+    Notes
+    -----
+    Includes character names absent from the lowercased first action sentence,
+    first clause of first action, and first clause of setting. Prints final
+    length to stdout.
+
+    Edge cases
+    ----------
+    Missing lists default to empty contributions; ``print`` executes even for
+    empty ``parts`` after join.
     """
     parts: list[str] = []
 
@@ -353,21 +550,37 @@ def build_constraints(
     config: Optional[dict[str, Any]] = None,
 ) -> dict:
     """
-    Build a structured constraint dict from a parsed scene.
+    Assemble structured constraints and attach a per-scene layout plan.
 
     Parameters
     ----------
     scene : dict
-        Scene from the parser (expects characters_present, optional description, etc.).
-    character_descriptions : dict
-        name → description for grounding.
-    config : dict, optional
-        Master config; uses config["layout"] for optional LLM layout (defaults if missing).
+        Parser scene with ``characters_present`` and optional description,
+        setting, mood, time fields.
+    character_descriptions : dict[str, str]
+        Maps character name to textual description for constraint payload.
+    config : dict[str, Any] or None, optional
+        When ``None``, treated as empty dict for layout settings.
 
     Returns
     -------
     dict
-        Structured constraints before collapsing to a single prompt string.
+        Constraint dict with ``characters``, ``actions``, ``setting``, ``time``,
+        ``mood``, and ``layout`` keys.
+
+    Notes
+    -----
+    Populates ``characters`` from ``characters_present``, adds scene description
+    to ``actions`` when present, copies setting/time/mood. Layout selection:
+    optional LLM via ``generate_layout_with_llm`` with JSON disk cache keyed by
+    scene; falls back to ``fallback_layout`` on validation failure. Prints cache
+    and layout diagnostics to stdout.
+
+    Edge cases
+    ----------
+    When cached layout invalidates, removes stale cache entry before fallback.
+    Global ``_LAST_GROQ_LAYOUT_RESPONSE_TEXT`` reflects last Groq raw output in
+    LLM path.
     """
     cfg = config or {}
     layout_cfg = cfg.get("layout") or {}
@@ -458,9 +671,30 @@ def build_prompt_from_constraints(
     include_layout: bool = True,
 ) -> str:
     """
-    Minimal comma-joined prompt: character names (only if not already in the action line),
-    first sentence of action, short setting; optional non-redundant layout prefixes.
-    No per-character description blocks, time, or mood.
+    Flatten structured constraints into a compact natural-language prompt.
+
+    Parameters
+    ----------
+    constraints : dict
+        Same structure produced by ``build_constraints``.
+    include_layout : bool, optional
+        When ``True``, prefixes with non-redundant ``name at position depth``
+        fragments drawn from ``constraints["layout"]``.
+
+    Returns
+    -------
+    str
+        Comma-joined prompt truncated to 200 characters if needed.
+
+    Notes
+    -----
+    Skips character names already present in the lowercased action clause when
+    building layout fragments and name list. Logs final length via print.
+
+    Edge cases
+    ----------
+    If ``layout`` missing or malformed, layout insertion is skipped silently
+    (guarded by isinstance checks).
     """
     parts: list[str] = []
 
@@ -522,6 +756,44 @@ def build_prompt(
     style_prefix: str,
     style_suffix: str,
 ):
+    """
+    Legacy prompt assembly with progressive truncation to a character budget.
+
+    Parameters
+    ----------
+    scene : dict
+        Must include non-empty stripped ``description``; may include ``setting``,
+        ``time_of_day``, ``mood``.
+    character_descriptions : dict[str, str]
+        Used to prefix ``name (desc)`` fragments before the scene description.
+    style_prefix : str
+        Accepted for API compatibility; not referenced in the function body.
+    style_suffix : str
+        Accepted for API compatibility; not referenced in the function body.
+
+    Returns
+    -------
+    str
+        Final prompt after optional removal of mood, shortening setting, or hard
+        slice to ``MAX_CHARS`` (320).
+
+    Notes
+    -----
+    Builds ``main_block`` from character context plus description, appends
+    setting and time, then mood. If over budget, drops mood; if still over,
+    replaces setting with first 50 characters of raw ``setting`` string; if
+    still over, truncates tail to ``MAX_CHARS``. Logs pre- and post-trim strings.
+
+    Raises
+    ------
+    ValueError
+        If ``description`` is missing or whitespace-only after strip.
+
+    Edge cases
+    ----------
+    When ``setting_block`` is falsey, the second trimming stage is skipped.
+    ``style_prefix`` and ``style_suffix`` do not affect the returned string.
+    """
     MAX_CHARS = 320
 
     description = scene.get("description", "").strip()
@@ -532,9 +804,6 @@ def build_prompt(
     time = scene.get("time_of_day", "").strip()
     mood = scene.get("mood", "").strip()
 
-    # --------------------------------------------------
-    # 1. Build CHARACTER-GROUNDED ACTION
-    # --------------------------------------------------
     grounded_sentences = []
 
     for name, desc in character_descriptions.items():
@@ -544,20 +813,11 @@ def build_prompt(
 
     char_context = ", ".join(grounded_sentences)
 
-    # Merge with action
     if char_context:
         main_block = f"{char_context}. {description}"
     else:
         main_block = description
 
-    # --------------------------------------------------
-    # 2. KEY OBJECTS (implicitly inside description)
-    # --------------------------------------------------
-    # (Already handled via description — keep simple)
-
-    # --------------------------------------------------
-    # 3. SETTING (LOW PRIORITY)
-    # --------------------------------------------------
     setting_parts = []
 
     if setting:
@@ -567,14 +827,8 @@ def build_prompt(
 
     setting_block = ", ".join(setting_parts)
 
-    # --------------------------------------------------
-    # 4. MOOD (LOWEST PRIORITY)
-    # --------------------------------------------------
     mood_block = mood if mood else ""
 
-    # --------------------------------------------------
-    # 5. Assemble FULL prompt (priority order)
-    # --------------------------------------------------
     parts = [main_block]
 
     if setting_block:
@@ -586,11 +840,7 @@ def build_prompt(
     full_prompt = ". ".join(parts)
     whole_prompt = full_prompt
 
-    # --------------------------------------------------
-    # 6. SMART TRIMMING (NO IDENTITY LOSS)
-    # --------------------------------------------------
     if len(full_prompt) > MAX_CHARS:
-        # Step 1: remove mood
         if mood_block:
             parts = [main_block]
             if setting_block:
@@ -598,19 +848,14 @@ def build_prompt(
             full_prompt = ". ".join(parts)
 
     if len(full_prompt) > MAX_CHARS:
-        # Step 2: shorten setting (NOT characters)
         if setting_block:
-            setting_short = setting[:50]  # safe trim
+            setting_short = setting[:50]
             parts = [main_block, setting_short]
             full_prompt = ". ".join(parts)
 
     if len(full_prompt) > MAX_CHARS:
-        # Step 3: last resort → trim ONLY tail
         full_prompt = full_prompt[:MAX_CHARS]
 
-    # --------------------------------------------------
-    # 7. Logging 
-    # --------------------------------------------------
     logger.info(
         "\n[Prompt Debug - NEW]\n"
         f"[SCENE ID]: {scene.get('scene_id', 'unknown')}\n\n"

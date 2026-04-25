@@ -56,6 +56,32 @@ class LLMBase(ABC):
         temperature: float = 0.4,
         max_tokens: int = 2048,
     ) -> None:
+        """
+        Store generation parameters and log client construction.
+
+        Parameters
+        ----------
+        model : str
+            Provider-specific model identifier.
+        temperature : float, optional
+            Sampling temperature (default 0.4).
+        max_tokens : int, optional
+            Maximum tokens for the completion (default 2048).
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Assigns ``self.model``, ``self.temperature``, and ``self.max_tokens`` and
+        emits an INFO log line with the concrete subclass name.
+
+        Edge cases
+        ----------
+        No validation is performed on ``temperature`` or ``max_tokens`` beyond
+        assignment.
+        """
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -71,20 +97,54 @@ class LLMBase(ABC):
         system_prompt: Optional[str] = None,
     ) -> LLMResponse:
         """
-        Send a prompt to the LLM and return a standardised LLMResponse.
+        Request a completion from the provider and return ``LLMResponse``.
 
         Parameters
         ----------
-        prompt        : The user-turn prompt text.
-        system_prompt : Optional system/instruction prompt (if provider supports it).
+        prompt : str
+            User or primary instruction text for the model.
+        system_prompt : str or None, optional
+            Optional system-level instructions when supported by the backend.
 
         Returns
         -------
         LLMResponse
+            Normalised wrapper with text, model id, optional token counts, and raw
+            provider payload.
+
+        Notes
+        -----
+        Subclasses implement provider-specific HTTP/SDK calls. This base
+        definition is abstract and not invoked directly.
+
+        Edge cases
+        ----------
+        Contract for empty ``prompt`` or unsupported ``system_prompt`` is defined
+        by each subclass.
         """
         ...
 
     def __repr__(self) -> str:
+        """
+        Return a concise, eval-like string of the client configuration.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        str
+            Form ``ClassName(model='...', temperature=..., max_tokens=...)``.
+
+        Notes
+        -----
+        Uses the runtime class name and current attribute values.
+
+        Edge cases
+        ----------
+        None.
+        """
         return (
             f"{self.__class__.__name__}("
             f"model={self.model!r}, "

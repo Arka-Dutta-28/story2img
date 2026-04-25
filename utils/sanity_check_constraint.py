@@ -40,6 +40,25 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv() -> None:
+        """
+        No-op stub when ``python-dotenv`` is not installed.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Defined only in the ``ImportError`` fallback branch.
+
+        Edge cases
+        ----------
+        Matches the callable shape expected by downstream ``load_dotenv()`` use.
+        """
         return
 
 from constraints import constraint_builder as cb
@@ -59,7 +78,30 @@ def _char_descriptions_for_scene(
     characters: list[dict[str, Any]],
     chars_present: list[str],
 ) -> dict[str, str]:
-    """Match pipeline fallback: descriptions for names present in this scene."""
+    """
+    Map scene character names to parser-provided descriptions.
+
+    Parameters
+    ----------
+    characters : list[dict[str, Any]]
+        Character records with ``name`` and optional ``description``.
+    chars_present : list[str]
+        Names appearing in the current scene.
+
+    Returns
+    -------
+    dict[str, str]
+        ``name -> description`` for each name in ``chars_present`` (default ``""``).
+
+    Notes
+    -----
+    Builds an intermediate dict from ``characters`` then projects onto
+    ``chars_present``.
+
+    Edge cases
+    ----------
+    Names absent from ``characters`` yield empty string values.
+    """
     by_name = {
         c["name"]: c.get("description", "")
         for c in characters
@@ -69,6 +111,31 @@ def _char_descriptions_for_scene(
 
 
 def _load_config(path: Path, no_layout_llm: bool) -> dict[str, Any]:
+    """
+    Load ``config.yaml`` and optionally disable LLM layout planning.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path to YAML config.
+    no_layout_llm : bool
+        When ``True``, copies the config and forces ``layout.use_llm_layout`` false.
+
+    Returns
+    -------
+    dict[str, Any]
+        Parsed YAML mapping, possibly shallow-copied and mutated for layout.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``path`` is not a file.
+
+    Edge cases
+    ----------
+    Shallow copy means nested dicts are shared unless replaced (layout dict is
+    replaced with a new dict).
+    """
     if not path.is_file():
         raise FileNotFoundError(f"Missing config: {path}")
     with path.open(encoding="utf-8") as f:
@@ -87,6 +154,35 @@ def _build_one_scene(
     config: dict[str, Any],
     verbose: bool,
 ) -> dict[str, Any]:
+    """
+    Build constraints and flattened prompt for one scene dict.
+
+    Parameters
+    ----------
+    scene : dict[str, Any]
+        Single scene record from parser output.
+    characters : list[dict[str, Any]]
+        Full story character list for description lookup.
+    config : dict[str, Any]
+        Master configuration passed to ``build_constraints``.
+    verbose : bool
+        When ``False``, redirects stdout during builder calls.
+
+    Returns
+    -------
+    dict[str, Any]
+        Row with scene metadata, ``constraints``, ``prompt_from_constraints``,
+        captured Groq raw text, and optional captured stdout.
+
+    Notes
+    -----
+    Reads ``cb._LAST_GROQ_LAYOUT_RESPONSE_TEXT`` after building. Uses
+    ``contextlib.redirect_stdout`` to a ``StringIO`` when not verbose.
+
+    Edge cases
+    ----------
+    Propagates exceptions from builder functions to the caller.
+    """
     chars_present = scene.get("characters_present", [])
     char_desc = _char_descriptions_for_scene(characters, chars_present)
 
@@ -115,6 +211,30 @@ def _build_one_scene(
 
 
 def run(argv: list[str] | None = None) -> int:
+    """
+    CLI entry: rebuild constraints from a cached parser JSON artifact.
+
+    Parameters
+    ----------
+    argv : list[str] or None, optional
+        Argument vector; ``None`` uses ``sys.argv`` via ``argparse``.
+
+    Returns
+    -------
+    int
+        Process exit code ``0`` on success, ``1`` on input errors.
+
+    Notes
+    -----
+    Parses CLI flags, loads parser bundle, iterates stories and scenes calling
+    ``_build_one_scene``, writes aggregated JSON under ``logs/constraint`` by
+    default.
+
+    Edge cases
+    ----------
+    Invalid ``results`` shape prints to stderr and returns ``1``. Per-scene
+    errors are captured inside scene rows without aborting the full run.
+    """
     parser = argparse.ArgumentParser(
         description="Build constraints from cached Gemini parser JSON (no Gemini API)."
     )

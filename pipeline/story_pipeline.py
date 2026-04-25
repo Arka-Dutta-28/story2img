@@ -37,50 +37,51 @@ def run_pipeline(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Run the full pipeline (no memory) over a list of parsed scenes.
-
-    For each scene:
-      1. Extract scene_text from scene["description"]
-      2. Generate N candidate images via generate_images()
-      3. Score candidates via score_candidates()
-         - reference_image is always None (no memory in this phase)
-         - previous_image is the previously selected image (or None for scene 1)
-      4. Select best image and append to results
-      5. Update previous_selected_image for next scene
+    Execute the no-memory image pipeline for each parsed scene in order.
 
     Parameters
     ----------
-    scenes : List of scene dicts from the parser. Each must contain at minimum:
-               "scene_id"    (int)
-               "description" (str) — used as scene_text for generation + evaluation
-    config : Master config dict (loaded from config.yaml). Expected sub-keys:
-               config["generation"]         — passed to generate_images()
-               config["evaluator"]["weights"] — passed to score_candidates()
+    scenes : list of dict[str, Any]
+        Scene records from the parser. Each dict should provide ``scene_id``
+        (optional; defaults to ``scene_idx + 1``) and ``description`` (required
+        non-empty string) used as both generation prompt and evaluation text.
+    config : dict[str, Any]
+        Application configuration. Must contain ``"generation"`` (passed to
+        ``generate_images``) and ``config["evaluator"]["weights"]`` (passed to
+        ``score_candidates``). Candidate count uses
+        ``int(config["generation"].get("num_candidates", 3))``.
 
     Returns
     -------
-    {
-        "images": [PIL.Image, ...],   # one selected image per scene, in order
-        "logs":   [                   # one entry per scene
-            {
-                "scene_id":    int,
-                "scene_text":  str,
-                "best_index":  int,
-                "scores":      list[dict],   # full score breakdown per candidate
-            },
-            ...
-        ]
-    }
+    dict[str, Any]
+        Mapping with keys ``"images"`` (list of ``PIL.Image.Image``, one best
+        image per scene in order) and ``"logs"`` (list of per-scene dicts with
+        ``scene_id``, ``scene_text``, ``best_index``, and ``scores``).
+
+    Notes
+    -----
+    For every scene, calls ``generate_images`` then ``score_candidates`` with
+    ``reference_image=None`` and ``previous_image`` set to the prior scene's
+    selected image (``None`` for the first scene). Appends the evaluator's
+    ``best_image`` to ``selected_images`` and updates ``previous_selected_image``.
 
     Raises
     ------
-    ValueError  if scenes is empty or required config keys are missing.
-    RuntimeError if generation or evaluation fails for any scene.
+    ValueError
+        If ``scenes`` is empty, required config keys are missing, a scene has no
+        non-empty ``description``, or ``generate_images`` / ``score_candidates``
+        preconditions fail.
+
+    Edge cases
+    ----------
+    Empty ``scenes`` raises immediately. Missing ``"generation"`` or
+    ``"evaluator"``/``"weights"`` raises ``ValueError``. Downstream failures
+    from generation or evaluation propagate as raised exceptions from those
+    calls.
     """
     if not scenes:
         raise ValueError("scenes list must not be empty.")
 
-    # -- Extract sub-configs -------------------------------------------------
     try:
         generation_config = config["generation"]
     except KeyError:
@@ -103,7 +104,6 @@ def run_pipeline(
 
     previous_selected_image: Optional[Image.Image] = None
 
-    # -- Scene loop ----------------------------------------------------------
     for scene_idx, scene in enumerate(scenes):
         scene_id   = scene.get("scene_id", scene_idx + 1)
         scene_text = scene.get("description", "")
@@ -115,7 +115,6 @@ def run_pipeline(
             scene_idx + 1, len(scenes), scene_id, scene_text[:80],
         )
 
-        # Step 1: Generate N candidate images --------------------------------
         generated = generate_images(
             prompt=scene_text,
             n=n_candidates,
@@ -127,9 +126,6 @@ def run_pipeline(
             "Scene %d — generated %d candidates", scene_idx + 1, len(candidate_images)
         )
 
-        # Step 2: Evaluate candidates ----------------------------------------
-        #   reference_image = None  (no memory in Phase 5)
-        #   previous_image  = last selected image (or None for first scene)
         eval_result = score_candidates(
             images=candidate_images,
             scene_text=scene_text,
@@ -148,7 +144,6 @@ def run_pipeline(
             eval_result["scores"][best_index]["final_score"],
         )
 
-        # Step 3: Collect results --------------------------------------------
         selected_images.append(best_image)
         logs.append({
             "scene_id":   scene_id,
@@ -157,7 +152,6 @@ def run_pipeline(
             "scores":     eval_result["scores"],
         })
 
-        # Step 4: Update previous image for next scene -----------------------
         previous_selected_image = best_image
 
     logger.info("run_pipeline complete | selected %d images", len(selected_images))

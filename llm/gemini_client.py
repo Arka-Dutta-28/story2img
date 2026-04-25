@@ -41,6 +41,41 @@ class GeminiClient(LLMBase):
         max_tokens: int = 2048,
         api_key: Optional[str] = None,
     ) -> None:
+        """
+        Configure the Gemini SDK and construct a reusable ``GenerativeModel``.
+
+        Parameters
+        ----------
+        model : str, optional
+            Gemini model name (default ``gemini-1.5-flash``).
+        temperature : float, optional
+            Passed to ``LLMBase`` and to ``GenerationConfig``.
+        max_tokens : int, optional
+            Mapped to ``max_output_tokens`` in ``GenerationConfig``.
+        api_key : str or None, optional
+            API key; if ``None``, uses ``GEMINI_API_KEY`` from the environment.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Calls ``genai.configure``, builds ``GenerationConfig``, and stores
+        ``self._client`` as ``GenerativeModel`` for subsequent ``complete`` calls.
+
+        Raises
+        ------
+        EnvironmentError
+            If no API key is available.
+        ImportError
+            If ``google.generativeai`` cannot be imported.
+
+        Edge cases
+        ----------
+        Instantiates the module-level client once per instance; does not validate
+        remote model availability until ``generate_content`` runs.
+        """
         super().__init__(model=model, temperature=temperature, max_tokens=max_tokens)
 
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -51,7 +86,7 @@ class GeminiClient(LLMBase):
             )
 
         try:
-            import google.generativeai as genai  # type: ignore
+            import google.generativeai as genai
         except ImportError as exc:
             raise ImportError(
                 "google-generativeai is not installed. "
@@ -65,7 +100,6 @@ class GeminiClient(LLMBase):
             max_output_tokens=self.max_tokens,
         )
 
-        # Model is instantiated once and reused across calls.
         self._genai = genai
         self._client = genai.GenerativeModel(
             model_name=self.model,
@@ -81,20 +115,36 @@ class GeminiClient(LLMBase):
         system_prompt: Optional[str] = None,
     ) -> LLMResponse:
         """
-        Send a prompt to Gemini and return a standardised LLMResponse.
-
-        Gemini does not support a separate system role in the basic
-        GenerativeModel API; if a system_prompt is provided it is
-        prepended to the user prompt with a clear delimiter.
+        Call ``generate_content`` on the configured Gemini model.
 
         Parameters
         ----------
-        prompt        : User-turn prompt text.
-        system_prompt : Optional instruction context.
+        prompt : str
+            Primary user content.
+        system_prompt : str or None, optional
+            If given, concatenated before ``prompt`` with a ``---`` separator.
 
         Returns
         -------
         LLMResponse
+            Text from ``raw_response.text``, token counts when present, and
+            ``raw`` set to the SDK response object.
+
+        Notes
+        -----
+        Logs debug line with character length; on API failure logs error and
+        wraps exception in ``RuntimeError``. Reads optional token fields from
+        ``usage_metadata`` via ``getattr``.
+
+        Raises
+        ------
+        RuntimeError
+            If ``generate_content`` raises.
+
+        Edge cases
+        ----------
+        If the SDK omits ``usage_metadata``, token fields in ``LLMResponse`` are
+        ``None``. Behavior for empty ``prompt`` depends on the Gemini API.
         """
         full_prompt = (
             f"{system_prompt}\n\n---\n\n{prompt}"
@@ -112,7 +162,6 @@ class GeminiClient(LLMBase):
 
         text = raw_response.text
 
-        # Token counts are available on usage_metadata when reported.
         usage = getattr(raw_response, "usage_metadata", None)
         prompt_tokens = getattr(usage, "prompt_token_count", None)
         completion_tokens = getattr(usage, "candidates_token_count", None)

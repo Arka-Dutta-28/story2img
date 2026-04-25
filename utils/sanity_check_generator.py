@@ -3,6 +3,27 @@ import os
 from generator import generate_images
 
 def run():
+    """
+    Generate two SDXL candidates from ``config.yaml`` and save under ``outputs``.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Reads ``generation`` block, calls ``generate_images`` with a fixed forest
+    prompt, saves each ``GeneratedImage.image`` as PNG.
+
+    Edge cases
+    ----------
+    Fails if ``config.yaml`` or ``generation`` key is missing; overwrites
+    ``outputs/test_image_*.png`` paths.
+    """
     with open("config.yaml") as f:
         config = yaml.safe_load(f)
 

@@ -1,11 +1,9 @@
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 import shutil
 import yaml
 
@@ -27,12 +25,30 @@ LOG_PATH    = PROJECT_ROOT / "logs" / "pipeline_v2_sanity_checks.json"
 
 from dotenv import load_dotenv
 load_dotenv()
-# --------------------------------------------------
-# Load stories
-# --------------------------------------------------
+
 
 def _load_stories():
-    """Load every ``*.txt`` under ``data/test_stories``; story id is ``path.stem`` (filename without extension, any name)."""
+    """
+    Load every ``*.txt`` story from ``data/test_stories`` as id/text pairs.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    list[dict[str, str]]
+        Each dict has ``id`` (filename stem) and ``text`` (UTF-8 stripped).
+
+    Notes
+    -----
+    Exits with code ``1`` when no matching files exist.
+
+    Edge cases
+    ----------
+    Uses lexicographic sort of paths; empty files still produce entries with
+    empty ``text``.
+    """
     txt_files = sorted(STORIES_DIR.glob("*.txt"))
     if not txt_files:
         print("No stories found.")
@@ -47,17 +63,35 @@ def _load_stories():
     ]
 
 
-# --------------------------------------------------
-# Grid builder
-# --------------------------------------------------
-
 def _create_image_grid(images: list[Image.Image], save_path: Path):
+    """
+    Paste ``images`` into a near-square grid and save to ``save_path``.
+
+    Parameters
+    ----------
+    images : list[PIL.Image.Image]
+        Non-empty list assumed to share identical ``size``.
+    save_path : pathlib.Path
+        Output path for the combined RGB image.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Computes ``cols = int(sqrt(n))`` and ``rows = ceil(n / cols)``, creates a
+    blank RGB canvas, pastes each image at grid coordinates.
+
+    Edge cases
+    ----------
+    Returns immediately when ``images`` is empty without creating a file.
+    """
     if not images:
         return
 
     n = len(images)
 
-    # auto layout (square-ish)
     cols = int(n ** 0.5)
     rows = (n + cols - 1) // cols
 
@@ -73,16 +107,32 @@ def _create_image_grid(images: list[Image.Image], save_path: Path):
     grid.save(save_path)
 
 
-# --------------------------------------------------
-# Main
-# --------------------------------------------------
-
 def run():
+    """
+    Run memory-aware ``run_pipeline_v2`` across all test stories with artifacts.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Deletes ``logs/prompt_debug.log`` when present before each story, injects
+    ``config["debug_output_dir"]`` per run, saves final PNGs and grid, copies
+    prompt debug log into the debug folder, appends JSON summary to
+    ``LOG_PATH``.
+
+    Edge cases
+    ----------
+    Catches ``Exception`` per story to record failures; mutates shared ``config``
+    dict with debug directory strings each iteration.
+    """
     print("\n=== PIPELINE V2 SANITY CHECK ===")
 
-    # -------------------------------
-    # Load config + models
-    # -------------------------------
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
 
@@ -99,9 +149,6 @@ def run():
 
     results = []
 
-    # -------------------------------
-    # Story loop
-    # -------------------------------
     for idx, story in enumerate(stories, 1):
         log_file = PROJECT_ROOT / "logs" / "prompt_debug.log"
         if log_file.exists():
@@ -115,9 +162,6 @@ def run():
         try:
             parsed = parser.parse(story["text"])
 
-            # -------------------------------
-            # Create versioned output dir
-            # -------------------------------
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
             story_root = OUTPUT_DIR / story["id"] / timestamp
@@ -126,16 +170,11 @@ def run():
 
             debug_dir.mkdir(parents=True, exist_ok=True)
             final_dir.mkdir(parents=True, exist_ok=True)
-            # Save config snapshot
             with open(story_root / "config.yaml", "w") as f:
                 yaml.dump(config, f, indent=2)
 
-            # pass debug path to pipeline
             config["debug_output_dir"] = str(debug_dir)
 
-            # -------------------------------
-            # Run pipeline
-            # -------------------------------
             pipeline_result = run_pipeline_v2(
                 parsed.scenes,
                 parsed.characters,
@@ -146,19 +185,12 @@ def run():
 
             images = pipeline_result["images"]
 
-            # -------------------------------
-            # Save FINAL outputs
-            # -------------------------------
             for i, img in enumerate(images):
                 img.save(final_dir / f"scene_{i}.png")
 
-            # grid
             grid_path = final_dir / "grid.png"
             _create_image_grid(images, grid_path)
 
-            # -------------------------------
-            # Log success
-            # -------------------------------
             results.append({
                 "story_id": story["id"],
                 "scene_count": len(parsed.scenes),
@@ -192,9 +224,6 @@ def run():
 
             print(f"Failed: {e}")
 
-    # -------------------------------
-    # Save run log
-    # -------------------------------
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with open(LOG_PATH, "w") as f:

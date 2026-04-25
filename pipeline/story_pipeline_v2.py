@@ -53,14 +53,28 @@ logger = logging.getLogger(__name__)
 
 def _analyze_prompt(prompt: str, scene_id: int) -> None:
     """
-    Print diagnostic information about the built prompt.
+    Emit stdout diagnostics for prompt length and a short preview.
 
-    Warnings
-    --------
-    - length < 80  : "Prompt too short"
-    - length > 500 : "Prompt may be truncated by model"
+    Parameters
+    ----------
+    prompt : str
+        Final prompt string for the current scene (not mutated).
+    scene_id : int
+        Scene identifier printed in the analysis header.
 
-    Does NOT modify the prompt.
+    Returns
+    -------
+    None
+        Always returns ``None``; side effect is printed lines only.
+
+    Notes
+    -----
+    Prints character length, ``length // 4`` as an estimated token count, optional
+    warnings when length is below 80 or above 500, and a 200-character preview.
+
+    Edge cases
+    ----------
+    Empty ``prompt`` still prints length 0 and preview ``''``. Does not raise.
     """
     length     = len(prompt)
     est_tokens = length // 4
@@ -87,63 +101,60 @@ def run_pipeline_v2(
     config:     dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Run the full pipeline (with memory) over a list of parsed scenes.
-
-    For each scene:
-      1. Extract scene_text and characters_present
-      2. Retrieve character descriptions and reference images from memory
-      3. Build final prompt via constraints then build_prompt_from_constraints (fallback: build_prompt)
-      4. Analyse prompt (_analyze_prompt) — warn only, never modify
-      5. Generate N candidate images via generate_images()
-      6. Evaluate candidates via score_candidates()
-         - scene_text (description) used for evaluation, NOT the built prompt
-         - reference_image: first available image from memory (or None)
-         - previous_image: last selected image (or None for scene 1)
-      7. Select best image
-      8. Update memory for all characters present in this scene
+    Run memory-aware generation and CLIP selection for each scene in order.
 
     Parameters
     ----------
-    scenes     : List of scene dicts from the parser. Each must contain:
-                   "scene_id"           (int)
-                   "description"        (str) — primary text for generation + eval
-                   "characters_present" (list[str]) — character names in this scene
-    characters : List of character dicts from the parser. Each must contain:
-                   "name"        (str)
-                   "description" (str)
-    config     : Master config dict. Expected sub-keys:
-                   config["generation"]             — passed to generate_images()
-                   config["evaluator"]["weights"]   — passed to score_candidates()
-                   config["constraint_builder"]     — style_prefix, style_suffix
-                   config["layout"]                   — optional LLM layout (constraint_builder)
-                   config["controlnet"]               — optional ControlNet path (controlled_generator)
-                   config["prompt_cache"]             — optional reuse of prompt.txt in debug_output_dir
+    scenes : list of dict[str, Any]
+        Parsed scenes. Each dict must include ``"description"`` (used as
+        ``scene_text`` for evaluation). ``scene_id`` defaults to loop index plus
+        one. ``characters_present`` defaults to ``[]``.
+    characters : list of dict[str, str]
+        Parsed characters; entries with ``name`` populate a lookup of default
+        descriptions when memory has none.
+    config : dict[str, Any]
+        Must include ``"generation"`` and ``config["evaluator"]["weights"]``.
+        Optional: ``constraint_builder``, ``layout``, ``controlnet``,
+        ``prompt_cache``, ``debug_output_dir`` (see module docstring).
 
     Returns
     -------
-    {
-        "images": [PIL.Image, ...],   # one selected image per scene, in order
-        "logs":   [
-            {
-                "scene_id":      int,
-                "prompt":        str,
-                "prompt_length": int,
-                "best_index":    int,
-                "scores":        list[dict],
-            },
-            ...
-        ]
-    }
+    dict[str, Any]
+        ``"images"``: ordered best ``PIL.Image.Image`` per scene.
+        ``"logs"``: per-scene dicts with ``scene_id``, ``prompt``,
+        ``prompt_length``, ``best_index``, and evaluator ``scores``.
+
+    Notes
+    -----
+    Builds prompts via ``build_constraints`` and either ``compress_prompt`` /
+    ``build_prompt_from_constraints`` or, on failure when ControlNet is off,
+    ``build_prompt``. Optional prompt cache reads/writes ``prompt.txt`` under
+    ``debug_output_dir``. Generates with ``generate_images_controlled`` when
+    ``config["controlnet"]["enabled"]`` is truthy, else ``generate_images``.
+    Evaluates with ``score_candidates`` using ``scene["description"]`` (not the
+    built prompt), a reference image from the first value in
+    ``memory.get_reference_images`` if any, and ``previous_selected_image``.
+    Updates ``MemoryManager`` after each scene. Reads optional
+    ``config["debug_output_dir"]`` for filesystem debug output when provided by
+    the caller.
 
     Raises
     ------
-    ValueError  if scenes is empty or required config keys are missing.
-    RuntimeError if generation or evaluation fails for any scene.
+    ValueError
+        For empty ``scenes``, missing config keys, ControlNet/layout/prompt
+        validation failures, and other explicit ``raise`` paths in the body.
+
+    Edge cases
+    ----------
+    When memory returns no descriptions, falls back to ``all_char_descriptions``
+    for the current scene's names. ``reference_image`` is ``None`` if
+    ``ref_images`` is empty; otherwise it is ``next(iter(ref_images.values()))``
+    (dictionary iteration order). Prompt cache with ControlNet still requires a
+    successful ``build_constraints`` call.
     """
     if not scenes:
         raise ValueError("scenes list must not be empty.")
 
-    # -- Extract sub-configs -------------------------------------------------
     try:
         generation_config = config["generation"]
     except KeyError:
@@ -160,8 +171,6 @@ def run_pipeline_v2(
 
     n_candidates = int(generation_config.get("num_candidates", 3))
 
-    # -- Build character description lookup ----------------------------------
-    # { name -> description } from the parser character list
     all_char_descriptions: dict[str, str] = {
         c["name"]: c.get("description", "")
         for c in characters
@@ -173,7 +182,6 @@ def run_pipeline_v2(
         len(scenes), n_candidates, len(all_char_descriptions),
     )
 
-    # -- Initialise memory ---------------------------------------------------
     memory = MemoryManager()
 
     selected_images: list[Image.Image] = []
@@ -186,9 +194,6 @@ def run_pipeline_v2(
         scene_text = scene["description"]
         chars_present = scene.get("characters_present", [])
 
-        # -------------------------------
-        # Memory retrieval
-        # -------------------------------
         char_descriptions = memory.get_character_descriptions(chars_present)
         ref_images = memory.get_reference_images(chars_present)
 
@@ -201,9 +206,6 @@ def run_pipeline_v2(
         cn_cfg = config.get("controlnet") or {}
         use_controlnet = bool(cn_cfg.get("enabled"))
 
-        # -------------------------------
-        # Debug scene directory (needed early for optional prompt cache read/write)
-        # -------------------------------
         scene_dir = config.get("debug_output_dir", None)
         scene_path: Optional[Path] = None
         if scene_dir:
@@ -215,9 +217,6 @@ def run_pipeline_v2(
         if scene_path is not None:
             prompt_file = scene_path / "prompt.txt"
 
-        # -------------------------------
-        # Build prompt (structured constraints → text; fallback: legacy build_prompt)
-        # -------------------------------
         constraints: Optional[dict[str, Any]] = None
         cached_prompt_text: Optional[str] = None
         if prompt_cache_enabled and prompt_file is not None and prompt_file.is_file():
@@ -284,9 +283,6 @@ def run_pipeline_v2(
 
         _analyze_prompt(prompt, scene_id)
 
-        # -------------------------------
-        # Generate candidates (optional ControlNet + layout control image)
-        # -------------------------------
         if use_controlnet:
             if not constraints or "layout" not in constraints:
                 raise ValueError(
@@ -329,31 +325,20 @@ def run_pipeline_v2(
             )
         candidate_images = [g.image for g in generated]
 
-        # -------------------------------
-        # DEBUG SAVE (SAFE)
-        # -------------------------------
         if scene_dir and scene_path is not None:
             candidates_path = scene_path / "candidates"
             candidates_path.mkdir(parents=True, exist_ok=True)
 
-            # prompt
             with open(scene_path / "prompt.txt", "w") as f:
                 f.write(prompt)
 
-            # candidates
             for i, img in enumerate(candidate_images):
                 img.save(candidates_path / f"{i}.png")
 
-        # -------------------------------
-        # Reference image
-        # -------------------------------
         reference_image = None
         if ref_images:
             reference_image = next(iter(ref_images.values()))
 
-        # -------------------------------
-        # Evaluate
-        # -------------------------------
         eval_result = score_candidates(
             images=candidate_images,
             scene_text=scene_text,
@@ -365,18 +350,12 @@ def run_pipeline_v2(
         best_index = eval_result["best_index"]
         best_image = eval_result["best_image"]
 
-        # -------------------------------
-        # SAVE DEBUG (post-eval)
-        # -------------------------------
         if scene_path is not None:
             best_image.save(scene_path / "selected.png")
 
             with open(scene_path / "scores.json", "w") as f:
                 json.dump(eval_result["scores"], f, indent=2)
 
-        # -------------------------------
-        # Collect results
-        # -------------------------------
         selected_images.append(best_image)
         logs.append({
             "scene_id": scene_id,
@@ -386,9 +365,6 @@ def run_pipeline_v2(
             "scores": eval_result["scores"],
         })
 
-        # -------------------------------
-        # Update memory
-        # -------------------------------
         memory.update_memory(
             characters=chars_present,
             image=best_image,

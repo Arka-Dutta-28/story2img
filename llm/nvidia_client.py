@@ -53,6 +53,43 @@ class NvidiaClient(LLMBase):
         base_url: str = DEFAULT_BASE_URL,
         api_key: Optional[str] = None,
     ) -> None:
+        """
+        Create an OpenAI-compatible client targeting NVIDIA's gateway.
+
+        Parameters
+        ----------
+        model : str, optional
+            Catalog model id (default ``minimaxai/minimax-m2.7``).
+        temperature : float, optional
+            Sampling temperature forwarded to chat completions.
+        max_tokens : int, optional
+            Maximum completion tokens.
+        top_p : float or None, optional
+            Nucleus sampling parameter; if ``None``, omitted from requests.
+        base_url : str, optional
+            API root; defaults to ``DEFAULT_BASE_URL``.
+        api_key : str or None, optional
+            If ``None``, uses ``NVIDIA_API_KEY`` from the environment.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Stores ``self._top_p`` and ``self._client`` as ``OpenAI(...)``.
+
+        Raises
+        ------
+        EnvironmentError
+            If no API key is available.
+        ImportError
+            If ``openai`` is not installed.
+
+        Edge cases
+        ----------
+        ``top_p`` may be explicitly ``None`` to disable the request field.
+        """
         super().__init__(model=model, temperature=temperature, max_tokens=max_tokens)
 
         resolved_key = api_key or os.environ.get("NVIDIA_API_KEY")
@@ -63,7 +100,7 @@ class NvidiaClient(LLMBase):
             )
 
         try:
-            from openai import OpenAI  # type: ignore
+            from openai import OpenAI
         except ImportError as exc:
             raise ImportError(
                 "openai is not installed. "
@@ -81,9 +118,34 @@ class NvidiaClient(LLMBase):
         system_prompt: Optional[str] = None,
     ) -> LLMResponse:
         """
-        Send a prompt to NVIDIA's OpenAI-compatible API and return LLMResponse.
+        Perform a non-streaming chat completion against the NVIDIA endpoint.
 
-        Uses non-streaming chat completions (same contract as GroqClient).
+        Parameters
+        ----------
+        prompt : str
+            User message body.
+        system_prompt : str or None, optional
+            Optional system message prepended when provided.
+
+        Returns
+        -------
+        LLMResponse
+            ``text`` from the first message content or ``""`` if missing;
+            optional usage fields; ``raw`` response object.
+
+        Notes
+        -----
+        Builds kwargs with ``stream=False`` and includes ``top_p`` only when
+        ``self._top_p`` is not ``None``.
+
+        Raises
+        ------
+        RuntimeError
+            If the chat completion call raises.
+
+        Edge cases
+        ----------
+        If ``msg.content`` is ``None``, returns empty string for ``text``.
         """
         messages: list[dict[str, Any]] = []
         if system_prompt:

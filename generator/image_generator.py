@@ -63,23 +63,35 @@ class GeneratedImage:
 
 def _resolve_seeds(n: int, config: dict) -> list[int]:
     """
-    Compute a list of N seeds based on the configured seed strategy.
-
-    Strategies
-    ----------
-    incremental : base_seed, base_seed+1, base_seed+2, ...
-                  Fully deterministic across runs.
-    random      : N independently sampled random integers in [0, 2^32).
-                  Different each run, but logged for reproducibility.
+    Produce ``n`` integer seeds according to ``config["seed_strategy"]``.
 
     Parameters
     ----------
-    n      : Number of seeds to produce.
-    config : The `generation` block from config.yaml.
+    n : int
+        Number of seeds required (length of returned list).
+    config : dict
+        Generation configuration; reads ``seed_strategy`` (default
+        ``"incremental"``) and ``base_seed`` (default ``42``).
 
     Returns
     -------
-    List of n integer seeds.
+    list[int]
+        ``n`` seeds: arithmetic progression for ``incremental``, or independent
+        draws for ``random``.
+
+    Notes
+    -----
+    ``incremental`` uses ``[base_seed + i for i in range(n)]``. ``random`` uses
+    ``random.randint(0, 2**32 - 1)`` per slot.
+
+    Raises
+    ------
+    ValueError
+        If ``seed_strategy`` is neither ``incremental`` nor ``random``.
+
+    Edge cases
+    ----------
+    Unknown strategy strings raise with a message listing supported values.
     """
     strategy  = config.get("seed_strategy", "incremental")
     base_seed = int(config.get("base_seed", 42))
@@ -106,18 +118,32 @@ _loaded_model_id: Optional[str] = None
 
 def _load_pipeline(model_id: str):
     """
-    Load (or return cached) the SDXL diffusers pipeline.
-
-    The pipeline is cached at module level so repeated calls to
-    generate_images() within a session do not reload weights.
+    Return a module-singleton ``StableDiffusionXLPipeline`` for ``model_id``.
 
     Parameters
     ----------
-    model_id : HuggingFace model ID, e.g. "stabilityai/stable-diffusion-xl-base-1.0".
+    model_id : str
+        Hugging Face model identifier for SDXL weights.
 
     Returns
     -------
     StableDiffusionXLPipeline
+        Loaded or cached pipeline on ``cuda``, ``mps``, or ``cpu``.
+
+    Notes
+    -----
+    Reuses ``_pipeline`` when ``_loaded_model_id`` matches. Selects dtype
+    ``float16`` on GPU backends else ``float32`` on CPU. Attempts
+    ``enable_xformers_memory_efficient_attention`` when not on CPU.
+
+    Raises
+    ------
+    ImportError
+        If ``torch`` or ``diffusers`` import fails.
+
+    Edge cases
+    ----------
+    If xformers enable fails, logs at DEBUG and continues without it.
     """
     global _pipeline, _loaded_model_id
 
@@ -136,7 +162,6 @@ def _load_pipeline(model_id: str):
             "  pip install diffusers transformers accelerate torch"
         ) from exc
 
-    # Detect device
     if torch.cuda.is_available():
         device    = "cuda"
         dtype     = torch.float16
@@ -163,7 +188,6 @@ def _load_pipeline(model_id: str):
     )
     pipe = pipe.to(device)
 
-    # Memory optimisations (no-op on CPU)
     if device != "cpu":
         try:
             pipe.enable_xformers_memory_efficient_attention()
@@ -188,37 +212,49 @@ def generate_images(
     config: dict,
 ) -> list[GeneratedImage]:
     """
-    Generate N candidate images for the given prompt using SDXL.
+    Generate ``n`` SDXL images for ``prompt`` using settings from ``config``.
 
     Parameters
     ----------
-    prompt : Text prompt describing the scene to generate.
-    n      : Number of candidate images to generate.
-    config : The `generation` block from config.yaml. Expected keys:
-               model_id        (str)   — HuggingFace model ID
-               steps           (int)   — number of inference steps
-               guidance_scale  (float) — CFG guidance scale
-               height          (int)   — image height in pixels
-               width           (int)   — image width in pixels
-               seed_strategy   (str)   — "incremental" | "random"
-               base_seed       (int)   — base seed for incremental strategy
+    prompt : str
+        Text prompt; must be non-empty after stripping.
+    n : int
+        Candidate count; must be at least 1.
+    config : dict
+        Generation block: ``model_id`` (optional default), ``steps``,
+        ``guidance_scale``, ``height``, ``width``, and seed fields consumed by
+        ``_resolve_seeds``.
 
     Returns
     -------
-    List of GeneratedImage, one per candidate, in generation order.
+    list[GeneratedImage]
+        One record per seed, preserving order, each wrapping ``output.images[0]``.
+
+    Notes
+    -----
+    Loads pipeline via ``_load_pipeline``, builds a ``torch.Generator`` per seed
+    on ``pipe.device.type``, calls ``pipe`` with ``num_images_per_prompt=1`` per
+    iteration.
 
     Raises
     ------
-    ValueError  if n < 1 or required config keys are missing.
-    ImportError if diffusers / torch are not installed.
-    RuntimeError if the pipeline call fails.
+    ValueError
+        For empty prompt or invalid ``n``.
+    ImportError
+        If ``torch`` is missing after pipeline load.
+    RuntimeError
+        If any ``pipe(...)`` call raises (re-raised with candidate index).
+
+    Edge cases
+    ----------
+    Each failed pipeline call logs and raises; prior successful candidates are
+    discarded (function does not return partial results on error).
     """
     if not prompt or not prompt.strip():
         raise ValueError("prompt must be a non-empty string.")
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}.")
 
-    # -- Extract config values -----------------------------------------------
     model_id       = config.get("model_id", "stabilityai/stable-diffusion-xl-base-1.0")
     steps          = int(config.get("steps", 30))
     guidance_scale = float(config.get("guidance_scale", 7.5))
@@ -230,11 +266,9 @@ def generate_images(
         n, steps, guidance_scale, width, height, model_id,
     )
 
-    # -- Resolve seeds --------------------------------------------------------
     seeds = _resolve_seeds(n, config)
     logger.info("Seeds for this call: %s", seeds)
 
-    # -- Load pipeline --------------------------------------------------------
     pipe = _load_pipeline(model_id)
 
     try:
@@ -242,7 +276,6 @@ def generate_images(
     except ImportError as exc:
         raise ImportError("torch is required. Run: pip install torch") from exc
 
-    # -- Generate one candidate at a time (simple, traceable) ----------------
     results: list[GeneratedImage] = []
     logger.debug(f"[GENERATOR] Prompt: {prompt}")
 

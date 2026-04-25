@@ -25,14 +25,34 @@ _cn_key: Optional[tuple[str, str]] = None
 
 def load_controlnet_pipeline(base_model_id: str, controlnet_model_id: str):
     """
-    Load (or return cached) SDXL + ControlNet pipeline.
+    Return a cached ``StableDiffusionXLControlNetPipeline`` pair for given ids.
 
     Parameters
     ----------
     base_model_id : str
-        HuggingFace SDXL base model id.
+        Hugging Face SDXL base checkpoint id.
     controlnet_model_id : str
-        HuggingFace ControlNet model id (e.g. depth SDXL).
+        Hugging Face ControlNet weights id.
+
+    Returns
+    -------
+    StableDiffusionXLControlNetPipeline
+        Pipeline moved to ``cuda``, ``mps``, or ``cpu`` with matching dtype.
+
+    Notes
+    -----
+    Caches in module globals ``_cn_pipeline`` and ``_cn_key``. Builds
+    ``ControlNetModel`` and SDXL ControlNet pipeline, enables xformers when not
+    on CPU (ignores failure).
+
+    Raises
+    ------
+    ImportError
+        If ``torch`` or ``diffusers`` imports fail.
+
+    Edge cases
+    ----------
+    CPU path logs a performance warning and uses ``float32``.
     """
     global _cn_pipeline, _cn_key
 
@@ -94,8 +114,36 @@ def load_controlnet_pipeline(base_model_id: str, controlnet_model_id: str):
 
 def layout_to_control_image(layout: dict[str, Any], width: int, height: int) -> Image.Image:
     """
-    Build a segmentation-style control map: each character gets a unique grayscale value.
-    Returned as RGB for the ControlNet pipeline.
+    Rasterise character layout into an RGB control image for ControlNet.
+
+    Parameters
+    ----------
+    layout : dict[str, Any]
+        Expected to contain ``characters`` list of dicts with ``name``, ``position``
+        in ``{left,center,right}``, and ``depth`` in
+        ``{foreground,midground,background}``.
+    width : int
+        Output image width in pixels.
+    height : int
+        Output image height in pixels.
+
+    Returns
+    -------
+    PIL.Image.Image
+        ``RGB`` image derived from grayscale ellipses and two-letter labels.
+
+    Notes
+    -----
+    Draws filled ellipses per valid character entry; maps position to horizontal
+    fraction and depth to vertical fraction; ellipse radius depends on depth.
+    Appends uppercase first-two letters of ``name`` as text.
+
+    Edge cases
+    ----------
+    If ``layout`` is not a dict or ``characters`` is not a list, returns a black
+    ``RGB`` image. Skips character dicts with unknown position/depth. Uses a
+    heuristic grayscale value spread across characters; single-character layouts
+    use value 200.
     """
     img = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(img)
@@ -138,7 +186,6 @@ def layout_to_control_image(layout: dict[str, Any], width: int, height: int) -> 
         else:
             radius = 40
 
-        # Unique grayscale value per character (segmentation-style).
         value = int(50 + (idx * 150 / max(1, len(chars) - 1))) if len(chars) > 1 else 200
 
         draw.ellipse(
@@ -170,10 +217,44 @@ def generate_images_controlled(
     config: dict[str, Any],
 ) -> list[GeneratedImage]:
     """
-    Generate N images with SDXL + ControlNet using a control image derived from ``layout``.
+    Generate ``n`` ControlNet-conditioned SDXL images for a fixed control map.
 
-    ``config`` must include base generation keys (``model_id``, ``steps``, etc.) and
-    a nested ``controlnet`` dict with at least ``model_id``.
+    Parameters
+    ----------
+    prompt : str
+        Text prompt; must be non-empty when stringified and stripped.
+    layout : dict[str, Any]
+        Passed to ``layout_to_control_image`` to build the conditioning image.
+    n : int
+        Number of candidates; must be at least 1.
+    config : dict[str, Any]
+        Base generation parameters plus ``controlnet`` block (``model_id``,
+        ``conditioning_scale``, ``save_debug_control``).
+
+    Returns
+    -------
+    list[GeneratedImage]
+        Same structure as ``generate_images`` outputs.
+
+    Notes
+    -----
+    Builds ``control_img``, optionally saves under ``debug_outputs`` when
+    ``save_debug_control`` is true (default), loads pipeline, resolves seeds via
+    ``_resolve_seeds``, and calls ``pipe`` with ``image=control_img`` and
+    ``controlnet_conditioning_scale``.
+
+    Raises
+    ------
+    ValueError
+        For invalid ``prompt`` or ``n``.
+    ImportError
+        If ``torch`` is missing.
+    RuntimeError
+        If a pipeline call fails.
+
+    Edge cases
+    ----------
+    Debug control filename includes a random integer in ``[0, 100000]``.
     """
     if not prompt or not str(prompt).strip():
         raise ValueError("prompt must be a non-empty string.")

@@ -47,6 +47,29 @@ _embedding_json_cache: Optional[dict[str, Any]] = None
 
 
 def _load_embedding_cache() -> dict[str, Any]:
+    """
+    Lazily load the on-disk JSON embedding cache into a module-global dict.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    dict[str, Any]
+        Mapping from cache key to serialised embedding list; empty dict if the
+        file is missing or invalid.
+
+    Notes
+    -----
+    Uses ``EMBEDDING_CACHE_PATH``; ensures parent directory exists. On failure
+    logs a warning and stores ``{}`` in ``_embedding_json_cache``.
+
+    Edge cases
+    ----------
+    If the JSON root is not a dict, replaces with ``{}``. Subsequent calls
+    return the cached in-memory object without re-reading disk.
+    """
     global _embedding_json_cache
     if _embedding_json_cache is not None:
         return _embedding_json_cache
@@ -65,6 +88,26 @@ def _load_embedding_cache() -> dict[str, Any]:
 
 
 def _save_embedding_cache(cache: dict[str, Any]) -> None:
+    """
+    Persist ``cache`` to ``EMBEDDING_CACHE_PATH`` as indented JSON.
+
+    Parameters
+    ----------
+    cache : dict[str, Any]
+        Serializable mapping to write.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Creates parent directories as needed. Swallows exceptions after logging.
+
+    Edge cases
+    ----------
+    Write failures only emit a warning; caller state remains unchanged on disk.
+    """
     try:
         EMBEDDING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with EMBEDDING_CACHE_PATH.open("w", encoding="utf-8") as f:
@@ -74,23 +117,60 @@ def _save_embedding_cache(cache: dict[str, Any]) -> None:
 
 
 def _embedding_cache_key(text: str) -> str:
+    """
+    Compute a SHA-256 hex digest of UTF-8 encoded ``text``.
+
+    Parameters
+    ----------
+    text : str
+        Input string used as cache key material.
+
+    Returns
+    -------
+    str
+        64-character hexadecimal digest.
+
+    Notes
+    -----
+    Uses ``hashlib.sha256`` over ``text.encode("utf-8")``.
+
+    Edge cases
+    ----------
+    Distinct Unicode strings that normalise differently remain distinct keys.
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _load_model(model_name: str = "ViT-L-14", pretrained: str = "laion2b_s32b_b82k"):
     """
-    Load (or return cached) an OpenCLIP model, preprocessor, and tokenizer.
-
-    The model is cached at module level so it is loaded only once per session.
+    Initialise OpenCLIP model, image preprocess, tokenizer, and device once.
 
     Parameters
     ----------
-    model_name : OpenCLIP architecture name. Default: "ViT-L-14".
-    pretrained : Pretrained weights tag.     Default: "laion2b_s32b_b82k".
+    model_name : str, optional
+        OpenCLIP architecture string (default ``ViT-L-14``).
+    pretrained : str, optional
+        Pretrained checkpoint tag (default ``laion2b_s32b_b82k``).
 
     Returns
     -------
-    (model, preprocess, tokenizer, device)
+    tuple
+        ``(model, preprocess, tokenizer, device)`` with ``model`` in eval mode.
+
+    Notes
+    -----
+    Caches in module globals when first called. Chooses ``cuda`` if available
+    else ``cpu``. Builds transforms via ``open_clip.create_model_and_transforms``.
+
+    Raises
+    ------
+    ImportError
+        If ``open_clip`` is not installed.
+
+    Edge cases
+    ----------
+    Ignores ``model_name``/``pretrained`` mismatch once cache is warm; first call
+    determines cached instance.
     """
     global _model, _preprocess, _tokenizer, _device
 
@@ -133,49 +213,96 @@ def _load_model(model_name: str = "ViT-L-14", pretrained: str = "laion2b_s32b_b8
 
 def _encode_image(img: Image.Image) -> torch.Tensor:
     """
-    Encode a PIL image into a normalised CLIP embedding.
+    Encode a PIL image to an L2-normalised CLIP image embedding.
 
     Parameters
     ----------
-    img : PIL Image (RGB or convertible).
+    img : PIL.Image.Image
+        Input image; converted to RGB if needed.
 
     Returns
     -------
-    Normalised 1-D float tensor on CPU.
+    torch.Tensor
+        1-D float tensor on CPU, L2-normalised along the feature dimension.
+
+    Notes
+    -----
+    Runs ``model.encode_image`` under ``torch.no_grad`` on the active CLIP device.
+
+    Edge cases
+    ----------
+    Non-RGB modes are converted before preprocessing.
     """
     model, preprocess, _, device = _load_model()
 
-    # Ensure RGB
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    tensor = preprocess(img).unsqueeze(0).to(device)   # (1, C, H, W)
+    tensor = preprocess(img).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        embedding = model.encode_image(tensor)          # (1, D)
+        embedding = model.encode_image(tensor)
 
     embedding = F.normalize(embedding, dim=-1)
-    return embedding.squeeze(0).cpu()                   # (D,)
+    return embedding.squeeze(0).cpu()
 
 
 def _encode_text_uncached(text: str) -> torch.Tensor:
     """
-    Encode a text string into a normalised CLIP embedding (no disk cache).
+    Compute a CLIP text embedding without reading or writing the JSON cache.
+
+    Parameters
+    ----------
+    text : str
+        Input string tokenised as a single batch element.
+
+    Returns
+    -------
+    torch.Tensor
+        1-D normalised CPU tensor.
+
+    Notes
+    -----
+    Uses the module singleton CLIP model and tokenizer.
+
+    Edge cases
+    ----------
+    Long texts are handled per tokenizer truncation rules inside OpenCLIP.
     """
     model, _, tokenizer, device = _load_model()
 
-    tokens = tokenizer([text]).to(device)               # (1, context_len)
+    tokens = tokenizer([text]).to(device)
 
     with torch.no_grad():
-        embedding = model.encode_text(tokens)           # (1, D)
+        embedding = model.encode_text(tokens)
 
     embedding = F.normalize(embedding, dim=-1)
-    return embedding.squeeze(0).cpu()                   # (D,)
+    return embedding.squeeze(0).cpu()
 
 
 def get_text_embedding(text: str) -> torch.Tensor:
     """
-    Text embedding with on-disk JSON cache (keyed by SHA-256 of text).
+    Return a CLIP text embedding, using a JSON file cache when possible.
+
+    Parameters
+    ----------
+    text : str
+        Query string; cache key is ``_embedding_cache_key(text)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Float32 tensor reconstructed from cache or from ``_encode_text_uncached``.
+
+    Notes
+    -----
+    On cache miss, encodes, stores ``emb.tolist()`` under the key, saves JSON,
+    and returns the fresh tensor.
+
+    Edge cases
+    ----------
+    Prints ``CACHE HIT: embedding`` on hits. Cache corruption is not repaired
+    beyond JSON load failure handling in ``_load_embedding_cache``.
     """
     key = _embedding_cache_key(text)
     cache = _load_embedding_cache()
@@ -192,29 +319,51 @@ def get_text_embedding(text: str) -> torch.Tensor:
 
 def _encode_text(text: str) -> torch.Tensor:
     """
-    Encode a text string into a normalised CLIP embedding (cached across runs).
+    Alias for ``get_text_embedding`` used by scoring helpers.
 
     Parameters
     ----------
-    text : Input string (will be truncated to model context length if needed).
+    text : str
+        Text to embed.
 
     Returns
     -------
-    Normalised 1-D float tensor on CPU.
+    torch.Tensor
+        Same as ``get_text_embedding``.
+
+    Notes
+    -----
+    Delegates entirely to ``get_text_embedding``.
+
+    Edge cases
+    ----------
+    Identical to ``get_text_embedding``.
     """
     return get_text_embedding(text)
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     """
-    Compute cosine similarity between two normalised 1-D tensors.
+    Dot-product similarity for L2-normalised 1-D tensors.
 
-    Both tensors are assumed to already be L2-normalised, so the dot product
-    equals cosine similarity directly.
+    Parameters
+    ----------
+    a, b : torch.Tensor
+        1-D tensors expected to be unit norm.
 
     Returns
     -------
-    Float in [-1.0, 1.0].
+    float
+        Scalar ``torch.dot(a, b)`` as Python float.
+
+    Notes
+    -----
+    Does not renormalise; assumes upstream CLIP encoders normalised embeddings.
+
+    Edge cases
+    ----------
+    If inputs are not normalised, the value is not guaranteed to lie in
+    ``[-1, 1]``.
     """
     return float(torch.dot(a, b).item())
 
@@ -225,15 +374,25 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def image_image_similarity(img1: Image.Image, img2: Image.Image) -> float:
     """
-    Compute CLIP cosine similarity between two PIL images.
+    CLIP cosine similarity between two images.
 
     Parameters
     ----------
-    img1, img2 : PIL Images to compare.
+    img1, img2 : PIL.Image.Image
+        Inputs passed through ``_encode_image``.
 
     Returns
     -------
-    Cosine similarity as a float in [-1.0, 1.0].
+    float
+        Similarity score from ``_cosine_similarity``.
+
+    Notes
+    -----
+    Logs debug with the numeric result.
+
+    Edge cases
+    ----------
+    See ``_cosine_similarity`` for assumptions on normalisation.
     """
     emb1 = _encode_image(img1)
     emb2 = _encode_image(img2)
@@ -244,16 +403,27 @@ def image_image_similarity(img1: Image.Image, img2: Image.Image) -> float:
 
 def text_image_similarity(text: str, img: Image.Image) -> float:
     """
-    Compute CLIP cosine similarity between a text string and a PIL image.
+    CLIP cosine similarity between a caption and an image.
 
     Parameters
     ----------
-    text : Description or query string.
-    img  : PIL Image to compare against.
+    text : str
+        Scene or query string (cached embedding path).
+    img : PIL.Image.Image
+        Candidate image embedding from ``_encode_image``.
 
     Returns
     -------
-    Cosine similarity as a float in [-1.0, 1.0].
+    float
+        Similarity from ``_cosine_similarity``.
+
+    Notes
+    -----
+    Logs debug with the score.
+
+    Edge cases
+    ----------
+    Uses disk-backed text cache via ``_encode_text``.
     """
     emb_text  = _encode_text(text)
     emb_image = _encode_image(img)
@@ -274,52 +444,50 @@ def score_candidates(
     weights:         dict,
 ) -> dict:
     """
-    Score all candidate images and return the best one with full score breakdown.
-
-    Scoring per candidate
-    ---------------------
-    scene_alignment      = text_image_similarity(scene_text, image)
-    identity_consistency = image_image_similarity(image, reference_image)
-                           if reference_image is not None else 0.0
-    temporal_consistency = image_image_similarity(image, previous_image)
-                           if previous_image is not None else 0.0
-    final_score          = (w_align    * scene_alignment)
-                         + (w_identity * identity_consistency)
-                         + (w_temporal * temporal_consistency)
+    Score candidate images with CLIP and select the highest weighted total.
 
     Parameters
     ----------
-    images          : List of N candidate PIL Images.
-    scene_text      : Scene description string (primary field from parser).
-    reference_image : Reference image for identity consistency, or None.
-    previous_image  : Previous scene's selected image for temporal consistency, or None.
-    weights         : Dict with keys 'scene_alignment', 'identity_consistency',
-                      'temporal_consistency' — values must sum to 1.0.
+    images : list[PIL.Image.Image]
+        Non-empty list of candidates in evaluation order.
+    scene_text : str
+        Text used to build a single shared text embedding for alignment.
+    reference_image : PIL.Image.Image or None
+        If provided, identity term uses CLIP similarity to this image; else 0.0.
+    previous_image : PIL.Image.Image or None
+        If provided, temporal term uses similarity to this image; else 0.0.
+    weights : dict
+        Must contain float-compatible ``w_align``, ``w_identity``, ``w_temporal``.
 
     Returns
     -------
-    {
-        "best_index" : int,
-        "best_image" : PIL.Image,
-        "scores"     : [
-            {
-                "scene_alignment"      : float,
-                "identity_consistency" : float,
-                "temporal_consistency" : float,
-                "final_score"          : float,
-            },
-            ...   # one entry per candidate, in input order
-        ]
-    }
+    dict
+        Keys ``best_index`` (argmax of ``final_score``), ``best_image`` (input
+        image at that index), and ``scores`` (list of per-candidate component
+        dicts).
+
+    Notes
+    -----
+    Precomputes embeddings for reference, previous, all candidates, and
+    ``scene_text`` once. For each candidate computes ``scene_alignment`` as
+    text-image cosine, ``identity_consistency`` and ``temporal_consistency`` via
+    image-image cosine when embeddings exist, else zero. ``final_score`` is the
+    weighted sum. Selects ``best_index`` with ``max`` on ``final_score``.
 
     Raises
     ------
-    ValueError  if images is empty or weights keys are missing.
+    ValueError
+        If ``images`` is empty or required weight keys are missing.
+
+    Edge cases
+    ----------
+    The error message for missing keys references capitalised key names while
+    the code reads lowercase ``w_*`` keys. Ties in ``final_score`` resolve to the
+    first maximal index per Python ``max`` ordering.
     """
     if not images:
         raise ValueError("images list must not be empty.")
 
-    # -- Extract weights -----------------------------------------------------
     try:
         w_align    = float(weights["w_align"])
         w_identity = float(weights["w_identity"])
@@ -340,36 +508,30 @@ def score_candidates(
         "provided" if previous_image  is not None else "None",
     )
 
-    # -- Pre-encode all images once -----------------------
     ref_emb  = _encode_image(reference_image) if reference_image is not None else None
     prev_emb = _encode_image(previous_image)  if previous_image  is not None else None
     image_embeddings = [_encode_image(img) for img in images]
 
-    # -- Score each candidate ------------------------------------------------
     all_scores: list[dict] = []
     text_emb = _encode_text(scene_text)
 
     for idx, img in enumerate(image_embeddings):
         logger.info("Scoring candidate %d/%d", idx + 1, len(images))
 
-        # Scene alignment (text ↔ image)
         scene_align   = float(_cosine_similarity(text_emb, img))
 
-        # Identity consistency (image ↔ reference)
         identity_cons = (
             float(_cosine_similarity(img, ref_emb))
             if ref_emb is not None
             else 0.0
         )
 
-        # Temporal consistency (image ↔ previous selected image)
         temporal_cons = (
             float(_cosine_similarity(img, prev_emb))
             if prev_emb is not None
             else 0.0
         )
 
-        # Weighted final score
         final = (
             w_align    * scene_align
             + w_identity * identity_cons

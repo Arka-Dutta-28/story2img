@@ -44,13 +44,46 @@ LOGS_DIR = PROJECT_ROOT / "logs" / "parser"
 
 @dataclass
 class StoryRecord:
+    """
+    One discovered test story file and its UTF-8 text payload.
+
+    Attributes
+    ----------
+    story_id : str
+        Filename stem used as identifier.
+    text : str
+        Stripped file contents.
+    source_path : pathlib.Path
+        Absolute-compatible path to the ``.txt`` file.
+    """
     story_id: str
     text: str
     source_path: Path
 
 
 def _discover_stories() -> tuple[list[StoryRecord], Path]:
-    """Load non-empty `*.txt` files from `data/test_stories`."""
+    """
+    Enumerate non-empty text stories under the test data directory.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    tuple[list[StoryRecord], pathlib.Path]
+        Records sorted by path and the base directory (possibly non-existent).
+
+    Notes
+    -----
+    Reads each ``*.txt`` twice when non-empty check passes (once in filter,
+    once in comprehension). Strips whitespace for ``text`` field.
+
+    Edge cases
+    ----------
+    If ``STORIES_DIR`` is not a directory, ``paths`` is empty and records list is
+    empty.
+    """
     base = STORIES_DIR
     paths = sorted(base.glob("*.txt")) if base.is_dir() else []
 
@@ -67,6 +100,27 @@ def _discover_stories() -> tuple[list[StoryRecord], Path]:
 
 
 def _load_llm_config() -> dict[str, Any]:
+    """
+    Load the ``llm`` subsection from the repository ``config.yaml``.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    dict[str, Any]
+        The value at key ``"llm"`` in the parsed YAML.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``CONFIG_PATH`` is missing.
+
+    Edge cases
+    ----------
+    Relies on YAML containing an ``llm`` key; ``KeyError`` would propagate if absent.
+    """
     if not CONFIG_PATH.is_file():
         raise FileNotFoundError(f"Missing config: {CONFIG_PATH}")
     with CONFIG_PATH.open(encoding="utf-8") as f:
@@ -75,7 +129,27 @@ def _load_llm_config() -> dict[str, Any]:
 
 
 def _llm_meta(llm_config: dict[str, Any]) -> tuple[str, str]:
-    """Provider key and model id string for logging."""
+    """
+    Extract provider name and model string for filenames and reports.
+
+    Parameters
+    ----------
+    llm_config : dict[str, Any]
+        The ``llm`` configuration block.
+
+    Returns
+    -------
+    tuple[str, str]
+        Lowercased ``provider`` and nested ``model`` string (empty if unknown).
+
+    Notes
+    -----
+    Reads ``gemini``, ``groq``, or ``nvidia`` sub-dicts based on ``provider``.
+
+    Edge cases
+    ----------
+    Unknown provider yields empty model id.
+    """
     provider = str(llm_config.get("provider", "")).lower()
     if provider == "gemini":
         model = str(llm_config.get("gemini", {}).get("model", ""))
@@ -89,7 +163,27 @@ def _llm_meta(llm_config: dict[str, Any]) -> tuple[str, str]:
 
 
 def _log_path_for_model(model: str) -> Path:
-    """`logs/parser_sanity_checks/<model>.json` with a filesystem-safe stem."""
+    """
+    Build a JSON log path under ``logs/parser`` with sanitised model stem.
+
+    Parameters
+    ----------
+    model : str
+        Raw model name possibly containing filesystem-hostile characters.
+
+    Returns
+    -------
+    pathlib.Path
+        ``LOGS_DIR / f"{stem}.json"`` after character replacement.
+
+    Notes
+    -----
+    Replaces ``/\\:*?"<>|`` with underscores; blank model becomes ``unknown``.
+
+    Edge cases
+    ----------
+    Does not collapse repeated underscores or enforce max path length.
+    """
     stem = model.strip() or "unknown"
     for bad, repl in (("/", "_"), ("\\", "_"), (":", "_"), ("*", "_"), ("?", "_"), ('"', "_"), ("<", "_"), (">", "_"), ("|", "_")):
         stem = stem.replace(bad, repl)
@@ -97,7 +191,28 @@ def _log_path_for_model(model: str) -> Path:
 
 
 def _summarise_parsed(result: Any) -> dict[str, Any]:
-    """Lightweight stats for console / JSON (no huge blobs)."""
+    """
+    Summarise a ``ParsedStory``-like object for logging.
+
+    Parameters
+    ----------
+    result : Any
+        Object with optional ``scenes``, ``characters``, ``style`` attributes.
+
+    Returns
+    -------
+    dict[str, Any]
+        Counts, scene id min/max among dict scenes, and style preview substring.
+
+    Notes
+    -----
+    Treats missing attributes as empty. Scene ids read via ``dict.get`` on each
+    scene when dict-shaped.
+
+    Edge cases
+    ----------
+    Non-dict entries in ``scenes`` are ignored for min/max computation.
+    """
     scenes = getattr(result, "scenes", []) or []
     scene_ids = [s.get("scene_id") for s in scenes if isinstance(s, dict)]
     return {
@@ -110,6 +225,29 @@ def _summarise_parsed(result: Any) -> dict[str, Any]:
 
 
 def run() -> int:
+    """
+    Execute parser smoke tests across ``data/test_stories`` and write JSON logs.
+
+    Parameters
+    ----------
+    None
+
+    Returns
+    -------
+    int
+        ``0`` if every story parses, ``1`` if none found or any failure occurred.
+
+    Notes
+    -----
+    Instantiates ``StoryParser`` with ``build_llm_client``, loops stories,
+    captures timing and errors, prints summaries, writes detailed JSON to
+    ``_log_path_for_model``.
+
+    Edge cases
+    ----------
+    Catches broad ``Exception`` per story to record failure rows. Uses
+    ``ascii()`` for style preview printing to avoid console encoding issues.
+    """
     print("\n=== StoryParser sanity check ===\n")
 
     stories, stories_dir = _discover_stories()
@@ -139,7 +277,7 @@ def run() -> int:
         try:
             parsed = parser.parse(rec.text)
             stats = _summarise_parsed(parsed)
-        except Exception as exc:  # noqa: BLE001 — surface any provider/parse failure
+        except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             failures += 1
 
@@ -208,7 +346,6 @@ def run() -> int:
                 f"scenes={stats['n_scenes']} "
                 f"scene_id_range=({stats['scene_id_min']}, {stats['scene_id_max']})"
             )
-            # Windows consoles often default to cp1252; avoid UnicodeEncodeError on style text.
             print(f"         style: {ascii(stats['style_preview'])}")
         if err:
             print(f"         {err}")
@@ -235,7 +372,6 @@ def run() -> int:
         json.dump(log_payload, f, indent=2, ensure_ascii=False)
 
     print("--- Summary (JSON) ---")
-    # Use ASCII escapes on stdout for narrow Windows consoles; full UTF-8 is in log_path.
     print(json.dumps(rows, indent=2, ensure_ascii=True))
     print(f"\nDetailed report written to {log_path}")
 

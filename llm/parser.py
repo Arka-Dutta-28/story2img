@@ -94,6 +94,28 @@ STRICT RULES:
 """
 
 def _build_user_prompt(story: str) -> str:
+    """
+    Format the user message that requests JSON story structure from the LLM.
+
+    Parameters
+    ----------
+    story : str
+        Raw story text embedded at the end of the template.
+
+    Returns
+    -------
+    str
+        Multi-line instruction string including schema and ``STORY:`` section.
+
+    Notes
+    -----
+    Static template defines required JSON keys and content rules; appends the
+    provided ``story`` verbatim inside the template.
+
+    Edge cases
+    ----------
+    Does not validate ``story`` length or encoding.
+    """
     return f"""
 IMPORTANT:
 - This is SHORT STORY -> MULTIPLE STILL IMAGE SCENES (NOT video)
@@ -145,9 +167,31 @@ Return ONLY the JSON. No other text."""
 # ---------------------------------------------------------------------------
 
 def _strip_code_fences(text: str) -> str:
-    """Remove markdown code fences that some models add despite instructions."""
+    """
+    Strip optional Markdown code fences from model output.
+
+    Parameters
+    ----------
+    text : str
+        Raw model output, possibly wrapped in fenced blocks.
+
+    Returns
+    -------
+    str
+        ``text`` with leading `` ```json``/`` ``` `` and trailing `` ``` ``
+        removed, then stripped.
+
+    Notes
+    -----
+    Applies case-insensitive regex to the opening fence; trims whitespace
+    before and after.
+
+    Edge cases
+    ----------
+    If no fences match, returns stripped ``text`` unchanged aside from outer
+    whitespace normalization from the initial ``strip``.
+    """
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
@@ -155,8 +199,31 @@ def _strip_code_fences(text: str) -> str:
 
 def _extract_json_object(text: str) -> str:
     """
-    Best-effort extraction of the first {...} block from text.
-    Handles cases where the model prepends/appends stray words.
+    Slice the substring from the first ``{`` through the last ``}`` inclusive.
+
+    Parameters
+    ----------
+    text : str
+        String expected to contain a JSON object.
+
+    Returns
+    -------
+    str
+        Substring ``text[start : end + 1]`` for the first ``{`` and last ``}``.
+
+    Notes
+    -----
+    Does not parse JSON; only locates delimiters.
+
+    Raises
+    ------
+    ValueError
+        If ``{`` or ``}`` is missing or their positions are invalid.
+
+    Edge cases
+    ----------
+    If multiple objects exist, the slice spans from the first opening brace to
+    the final closing brace in the string (may include extra content).
     """
     start = text.find("{")
     end = text.rfind("}")
@@ -167,13 +234,31 @@ def _extract_json_object(text: str) -> str:
 
 def _validate(data: dict[str, Any]) -> list[str]:
     """
-    Validate the parsed dict against the output contract.
+    Check required keys and types for parser output contract.
 
-    Returns a list of error strings. Empty list means valid.
+    Parameters
+    ----------
+    data : dict[str, Any]
+        Parsed JSON object to validate in-place logically (read-only).
+
+    Returns
+    -------
+    list[str]
+        Human-readable error messages; empty if ``data`` satisfies the schema.
+
+    Notes
+    -----
+    Validates ``characters`` (list of dicts with ``name`` and ``description``),
+    non-empty ``scenes`` (each dict with fixed scene fields), and non-empty
+    string ``style``.
+
+    Edge cases
+    ----------
+    Returns multiple errors when several constraints fail; does not short-circuit
+    on first error beyond natural control flow.
     """
     errors: list[str] = []
 
-    # Top-level keys
     if "characters" not in data:
         errors.append("Missing key: 'characters'")
     elif not isinstance(data["characters"], list):
@@ -236,27 +321,64 @@ class StoryParser:
     """
 
     def __init__(self, llm: LLMBase) -> None:
+        """
+        Attach an ``LLMBase`` client used by ``parse``.
+
+        Parameters
+        ----------
+        llm : LLMBase
+            Provider client implementing ``complete``.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Stores ``self._llm`` and logs initialisation.
+
+        Edge cases
+        ----------
+        None.
+        """
         self._llm = llm
         logger.info("StoryParser initialised | llm=%r", self._llm)
 
     # ------------------------------------------------------------------
     def parse(self, story: str) -> ParsedStory:
         """
-        Parse a story string into a validated ParsedStory.
-
-        Retries up to MAX_RETRIES times if the LLM returns malformed JSON.
+        Parse a story string into a validated ``ParsedStory`` via the LLM.
 
         Parameters
         ----------
-        story : Raw story text.
+        story : str
+            Raw narrative text. Must be non-empty after stripping.
 
         Returns
         -------
         ParsedStory
+            Dataclass with ``characters``, ``scenes``, ``style``, and ``raw_json``.
+
+        Notes
+        -----
+        Builds a fixed user prompt, calls ``self._llm.complete`` with
+        ``SYSTEM_PROMPT``, strips fences, extracts JSON, parses with ``json.loads``,
+        and validates with ``_validate``. On success returns ``ParsedStory``; on
+        failure logs and retries up to ``MAX_RETRIES``.
 
         Raises
         ------
-        RuntimeError if all retries are exhausted without a valid response.
+        ValueError
+            If ``story`` is empty or whitespace-only.
+        RuntimeError
+            If all attempts fail; message includes the last recorded error.
+
+        Edge cases
+        ----------
+        LLM exceptions are caught per attempt and recorded in ``last_error``.
+        Validation failures accumulate a list string in ``last_error``. If the
+        final attempt fails, ``last_error`` may be ``None`` only if no body ran
+        (not the case for normal loops).
         """
         if not story or not story.strip():
             raise ValueError("Story string is empty.")
@@ -280,7 +402,6 @@ class StoryParser:
             raw_text = response.text
             logger.debug("Raw LLM output (attempt %d):\n%s", attempt, raw_text)
 
-            # Clean and extract JSON
             try:
                 cleaned = _strip_code_fences(raw_text)
                 json_str = _extract_json_object(cleaned)
@@ -290,14 +411,12 @@ class StoryParser:
                 logger.warning("Attempt %d — %s", attempt, last_error)
                 continue
 
-            # Validate structure
             errors = _validate(data)
             if errors:
                 last_error = f"Validation errors: {errors}"
                 logger.warning("Attempt %d — %s", attempt, last_error)
                 continue
 
-            # All good
             logger.info(
                 "StoryParser.parse | success on attempt %d | "
                 "characters=%d scenes=%d style=%r",
