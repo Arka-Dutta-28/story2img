@@ -22,17 +22,27 @@ llm:
     top_p: 0.95
 
 # -----------------------------------------------------------------------------
-# Image Generation (SDXL)
+# Image Generation
 # -----------------------------------------------------------------------------
 generation:
-  model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+  backend: flux
   num_candidates: 3                    # N candidates per scene (owned by config)
-  steps: 30 
+  steps: 30
   guidance_scale: 7.5
   height: 1024
   width: 1024
   seed_strategy: "incremental"        # "incremental" | "random"
   base_seed: 42
+
+backends:
+  sdxl:
+    model_id: "stabilityai/stable-diffusion-xl-base-1.0"
+    precision: "fp16"
+  flux:
+    model_id: "black-forest-labs/FLUX.1-dev"
+    precision: "fp16"
+    quantized: false
+    load_in_8bit: true
 
 # -----------------------------------------------------------------------------
 # ControlNet (optional; SDXL + layout-derived control image)

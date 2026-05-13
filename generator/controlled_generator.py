@@ -1,9 +1,50 @@
 """
 generator/controlled_generator.py
 -----------------------------------
-Optional SDXL + ControlNet path driven by constraints[\"layout\"].
+Controlled generation orchestration for backends that support ControlNet.
 
-Does not replace ``image_generator.generate_images``; use when config enables ControlNet.
+This module retains the existing layout-derived control image path and delegates
+model-specific ControlNet pipeline logic to the selected backend. It provides
+a unified interface for layout-controlled generation across all supported backends.
+
+Responsibilities
+----------------
+- Convert story layouts to ControlNet conditioning images
+- Orchestrate ControlNet generation through backend abstraction
+- Maintain backward compatibility with existing layout format
+- Handle ControlNet availability checking and error handling
+- Provide unified interface for layout-controlled image generation
+
+Architecture role
+-----------------
+This module bridges the story layout system with backend-specific ControlNet
+implementations. It handles layout parsing and control image generation while
+delegating the actual conditioned generation to the selected backend.
+
+Layout processing
+-----------------
+- Converts character positions/depths to grayscale control images
+- Supports foreground/midground/background depth layers
+- Handles multiple characters with positional encoding
+- Generates conditioning images compatible with depth ControlNet
+
+Backend integration
+-------------------
+- Checks backend ControlNet support before generation
+- Delegates to backend-specific ControlNet pipelines
+- Passes control images and conditioning parameters to backend
+- Maintains consistent API across ControlNet-capable backends
+
+Supported backends
+------------------
+- sdxl: Full ControlNet support with depth conditioning
+- flux: ControlNet not yet supported (may change in future)
+
+Unsupported features
+--------------------
+- Multiple ControlNet models simultaneously
+- Non-depth ControlNet types (canny, pose, etc.)
+- Dynamic layout formats beyond character positioning
 """
 
 from __future__ import annotations
@@ -11,117 +52,25 @@ from __future__ import annotations
 import logging
 import os
 import random
-from typing import Any, Optional
+import time
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from generator.image_generator import GeneratedImage, _resolve_seeds
+from generator.backends.backend_factory import get_backend
+from generator.backends.base import GeneratedImage
 
 logger = logging.getLogger(__name__)
-
-_cn_pipeline = None
-_cn_key: Optional[tuple[str, str]] = None
-
-
-def load_controlnet_pipeline(base_model_id: str, controlnet_model_id: str):
-    """
-    Return a cached ``StableDiffusionXLControlNetPipeline`` pair for given ids.
-
-    Parameters
-    ----------
-    base_model_id : str
-        Hugging Face SDXL base checkpoint id.
-    controlnet_model_id : str
-        Hugging Face ControlNet weights id.
-
-    Returns
-    -------
-    StableDiffusionXLControlNetPipeline
-        Pipeline moved to ``cuda``, ``mps``, or ``cpu`` with matching dtype.
-
-    Notes
-    -----
-    Caches in module globals ``_cn_pipeline`` and ``_cn_key``. Builds
-    ``ControlNetModel`` and SDXL ControlNet pipeline, enables xformers when not
-    on CPU (ignores failure).
-
-    Raises
-    ------
-    ImportError
-        If ``torch`` or ``diffusers`` imports fail.
-
-    Edge cases
-    ----------
-    CPU path logs a performance warning and uses ``float32``.
-    """
-    global _cn_pipeline, _cn_key
-
-    key = (base_model_id, controlnet_model_id)
-    if _cn_pipeline is not None and _cn_key == key:
-        logger.debug("Reusing cached ControlNet pipeline for %s + %s", base_model_id, controlnet_model_id)
-        return _cn_pipeline
-
-    try:
-        import torch
-        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
-    except ImportError as exc:
-        raise ImportError(
-            "diffusers / torch required for ControlNet. "
-            "Run: pip install diffusers transformers accelerate torch"
-        ) from exc
-
-    if torch.cuda.is_available():
-        device = "cuda"
-        dtype = torch.float16
-    elif torch.backends.mps.is_available():
-        device = "mps"
-        dtype = torch.float16
-    else:
-        device = "cpu"
-        dtype = torch.float32
-        logger.warning("ControlNet on CPU: generation will be slow.")
-
-    logger.info(
-        "Loading ControlNet | base=%s  controlnet=%s  device=%s  dtype=%s",
-        base_model_id, controlnet_model_id, device, dtype,
-    )
-
-    controlnet = ControlNetModel.from_pretrained(
-        controlnet_model_id,
-        torch_dtype=dtype,
-    )
-
-    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        base_model_id,
-        controlnet=controlnet,
-        torch_dtype=dtype,
-        use_safetensors=True,
-        variant="fp16" if dtype == torch.float16 else None,
-    )
-    pipe = pipe.to(device)
-
-    if device != "cpu":
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-        except Exception:
-            logger.debug("xformers not available for ControlNet pipeline")
-
-    _cn_pipeline = pipe
-    _cn_key = key
-    logger.info("ControlNet pipeline ready")
-    return _cn_pipeline
 
 
 def layout_to_control_image(layout: dict[str, Any], width: int, height: int) -> Image.Image:
     """
-    Rasterise character layout into an RGB control image for ControlNet.
+    Convert story layout to ControlNet depth conditioning image.
 
     Parameters
     ----------
     layout : dict[str, Any]
-        Expected to contain ``characters`` list of dicts with ``name``, ``position``
-        in ``{left,center,right}``, and ``depth`` in
-        ``{foreground,midground,background}``.
+        Layout specification with character positions and depths.
     width : int
         Output image width in pixels.
     height : int
@@ -129,21 +78,24 @@ def layout_to_control_image(layout: dict[str, Any], width: int, height: int) -> 
 
     Returns
     -------
-    PIL.Image.Image
-        ``RGB`` image derived from grayscale ellipses and two-letter labels.
+    Image.Image
+        Grayscale PIL image for ControlNet depth conditioning.
 
     Notes
     -----
-    Draws filled ellipses per valid character entry; maps position to horizontal
-    fraction and depth to vertical fraction; ellipse radius depends on depth.
-    Appends uppercase first-two letters of ``name`` as text.
+    Converts character positions to depth values:
+    - foreground: 0.7 (lighter)
+    - midground: 0.5 (medium)
+    - background: 0.3 (darker)
+
+    Position mapping: left=0.25, center=0.5, right=0.75 of width.
+    Characters rendered as filled circles with depth-based grayscale.
 
     Edge cases
     ----------
-    If ``layout`` is not a dict or ``characters`` is not a list, returns a black
-    ``RGB`` image. Skips character dicts with unknown position/depth. Uses a
-    heuristic grayscale value spread across characters; single-character layouts
-    use value 200.
+    Invalid layout returns blank image.
+    Missing characters/depths handled gracefully.
+    Non-dict layout returns blank image.
     """
     img = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(img)
@@ -178,36 +130,84 @@ def layout_to_control_image(layout: dict[str, Any], width: int, height: int) -> 
 
         x = int(positions[pos] * width)
         y = int(depths[dep] * height)
-
-        if c["depth"] == "foreground":
-            radius = 80
-        elif c["depth"] == "midground":
-            radius = 60
-        else:
-            radius = 40
-
+        radius = 80 if dep == "foreground" else 60 if dep == "midground" else 40
         value = int(50 + (idx * 150 / max(1, len(chars) - 1))) if len(chars) > 1 else 200
 
-        draw.ellipse(
-            [x - radius, y - radius, x + radius, y + radius],
-            fill=value,
-        )
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=value)
 
         try:
             font = ImageFont.load_default()
-        except:
+        except Exception:
             font = None
 
-        label = c["name"][:2].upper()
-
-        draw.text(
-            (x - 10, y - 10),
-            label,
-            fill=value,
-            font=font
-        )
+        label = str(c.get("name", ""))[:2].upper()
+        draw.text((x - 10, y - 10), label, fill=value, font=font)
 
     return img.convert("RGB")
+
+
+def _resolve_seeds(n: int, config: dict[str, Any]) -> list[int]:
+    """
+    Generate list of seeds for controlled generation.
+
+    Parameters
+    ----------
+    n : int
+        Number of seeds to generate.
+    config : dict[str, Any]
+        Config containing seed_strategy and base_seed.
+
+    Returns
+    -------
+    list[int]
+        List of n seed values.
+
+    Notes
+    -----
+    Same seed resolution logic as standard generation.
+    Supports 'incremental' and 'random' strategies.
+    Ensures reproducible controlled generation.
+
+    Raises
+    ------
+    ValueError
+        If seed_strategy is not supported.
+    """
+    strategy = config.get("seed_strategy", "incremental")
+    base_seed = int(config.get("base_seed", 42))
+
+    if strategy == "incremental":
+        return [base_seed + i for i in range(n)]
+    if strategy == "random":
+        return [random.randint(0, 2**32 - 1) for _ in range(n)]
+
+    raise ValueError(
+        f"Unknown seed_strategy: {strategy!r}. Supported values: 'incremental', 'random'."
+    )
+
+
+def _extract_generation_config(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Extract generation config from full config dict.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Input config that may contain 'generation' section.
+
+    Returns
+    -------
+    tuple[dict[str, Any], dict[str, Any]]
+        (generation_config, full_config) tuple.
+
+    Notes
+    -----
+    Same logic as standard generation for consistency.
+    Handles backward compatibility for older configs.
+    """
+    if "generation" in config:
+        return config["generation"], config
+    return config, {"generation": config}
 
 
 def generate_images_controlled(
@@ -217,114 +217,114 @@ def generate_images_controlled(
     config: dict[str, Any],
 ) -> list[GeneratedImage]:
     """
-    Generate ``n`` ControlNet-conditioned SDXL images for a fixed control map.
+    Generate images with ControlNet conditioning from story layout.
+
+    This function converts story layouts to control images and generates
+    conditioned images using backends that support ControlNet.
 
     Parameters
     ----------
     prompt : str
-        Text prompt; must be non-empty when stringified and stripped.
+        Text prompt for the scene.
     layout : dict[str, Any]
-        Passed to ``layout_to_control_image`` to build the conditioning image.
+        Story layout specification with character positions/depths.
     n : int
-        Number of candidates; must be at least 1.
+        Number of images to generate.
     config : dict[str, Any]
-        Base generation parameters plus ``controlnet`` block (``model_id``,
-        ``conditioning_scale``, ``save_debug_control``).
+        Configuration with backend selection and ControlNet parameters.
 
     Returns
     -------
     list[GeneratedImage]
-        Same structure as ``generate_images`` outputs.
+        List of generated images with metadata.
 
     Notes
     -----
-    Builds ``control_img``, optionally saves under ``debug_outputs`` when
-    ``save_debug_control`` is true (default), loads pipeline, resolves seeds via
-    ``_resolve_seeds``, and calls ``pipe`` with ``image=control_img`` and
-    ``controlnet_conditioning_scale``.
+    Converts layout to depth control image using layout_to_control_image.
+    Checks backend ControlNet support before generation.
+    Uses depth ControlNet by default (configurable via controlnet.model_id).
+    Conditioning scale defaults to 0.5 but configurable.
 
     Raises
     ------
     ValueError
-        For invalid ``prompt`` or ``n``.
-    ImportError
-        If ``torch`` is missing.
+        If prompt is empty or n < 1.
     RuntimeError
-        If a pipeline call fails.
+        If selected backend doesn't support ControlNet.
 
     Edge cases
     ----------
-    Debug control filename includes a random integer in ``[0, 100000]``.
+    Invalid layouts generate without conditioning (standard generation).
+    Backend switching handled with proper ControlNet pipeline management.
+    ControlNet parameters override defaults from config.
     """
     if not prompt or not str(prompt).strip():
         raise ValueError("prompt must be a non-empty string.")
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}.")
 
-    cn_block = config.get("controlnet") or {}
-    model_id = config.get("model_id", "stabilityai/stable-diffusion-xl-base-1.0")
-    cn_model_id = cn_block.get("model_id", "diffusers/controlnet-depth-sdxl-1.0")
+    generation_config, full_config = _extract_generation_config(config)
+    backend = get_backend(full_config)
 
-    steps = int(config.get("steps", 30))
-    guidance_scale = float(config.get("guidance_scale", 7.5))
-    height = int(config.get("height", 768))
-    width = int(config.get("width", 768))
-    conditioning_scale = float(cn_block.get("conditioning_scale", 0.5))
+    if not backend.supports_controlnet():
+        raise RuntimeError(
+            f"Backend '{backend.backend_name}' does not support ControlNet generation."
+        )
+
+    steps = int(generation_config.get("steps", 30))
+    guidance_scale = float(generation_config.get("guidance_scale", 7.5))
+    height = int(generation_config.get("height", 768))
+    width = int(generation_config.get("width", 768))
+    conditioning_scale = float((config.get("controlnet") or {}).get("conditioning_scale", 0.5))
 
     logger.info(
-        "generate_images_controlled | n=%d  steps=%d  guidance=%.1f  %dx%d  base=%s  cn=%s",
-        n, steps, guidance_scale, width, height, model_id, cn_model_id,
+        "generate_images_controlled | backend=%s steps=%d guidance=%.1f %dx%d",
+        backend.backend_name,
+        steps,
+        guidance_scale,
+        width,
+        height,
     )
 
     control_img = layout_to_control_image(layout, width, height)
-    print("CONTROL IMAGE GENERATED")
-    print("LAYOUT USED:", layout)
 
-    if cn_block.get("save_debug_control", True):
+    if (config.get("controlnet") or {}).get("save_debug_control", True):
         debug_dir = "debug_outputs"
         os.makedirs(debug_dir, exist_ok=True)
         debug_path = os.path.join(debug_dir, f"control_{random.randint(0, 100000)}.png")
         control_img.save(debug_path)
-        print(f"CONTROL IMAGE SAVED: {debug_path}")
+        logger.info("Saved debug control image: %s", debug_path)
 
-    pipe = load_controlnet_pipeline(model_id, cn_model_id)
-
-    try:
-        import torch
-    except ImportError as exc:
-        raise ImportError("torch is required.") from exc
-
-    seeds = _resolve_seeds(n, config)
+    seeds = _resolve_seeds(n, generation_config)
     logger.info("Seeds (controlled): %s", seeds)
 
     results: list[GeneratedImage] = []
+    logger.debug("[CONTROLLED GENERATOR] Prompt: %s", prompt)
 
     for idx, seed in enumerate(seeds):
-        logger.info("Controlled candidate %d/%d  seed=%d", idx + 1, n, seed)
-        generator = torch.Generator(device=pipe.device.type).manual_seed(seed)
+        logger.info("Controlled candidate %d/%d seed=%d", idx + 1, n, seed)
+        start = time.perf_counter()
 
         try:
-            output = pipe(
+            image = backend.generate_controlled(
                 prompt=prompt,
-                image=control_img,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                height=height,
-                width=width,
-                generator=generator,
-                controlnet_conditioning_scale=conditioning_scale,
-                num_images_per_prompt=1,
+                control_image=control_img,
+                seed=seed,
+                config=full_config,
             )
         except Exception as exc:
-            logger.error("ControlNet pipeline failed for candidate %d: %s", idx, exc)
-            raise RuntimeError(
-                f"ControlNet generation failed for candidate {idx} (seed={seed}): {exc}"
-            ) from exc
+            logger.error(
+                "ControlNet generation failed for candidate %d (seed=%d): %s",
+                idx,
+                seed,
+                exc,
+            )
+            raise
 
-        pil_image = output.images[0]
+        elapsed = time.perf_counter() - start
         results.append(
             GeneratedImage(
-                image=pil_image,
+                image=image,
                 seed=seed,
                 candidate_idx=idx,
                 prompt=prompt,
@@ -332,8 +332,13 @@ def generate_images_controlled(
                 guidance_scale=guidance_scale,
                 width=width,
                 height=height,
+                backend_name=backend.backend_name,
+                precision=str(generation_config.get("precision", "fp16")),
+                quantized=bool(generation_config.get("quantized", False)),
+                generation_time=elapsed,
             )
         )
+        logger.info("Controlled candidate %d/%d done seed=%d time=%.2fs", idx + 1, n, seed, elapsed)
 
-    logger.info("generate_images_controlled complete | %d images", len(results))
+    logger.info("generate_images_controlled complete | returned %d images", len(results))
     return results

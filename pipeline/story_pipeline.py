@@ -118,7 +118,7 @@ def run_pipeline(
         generated = generate_images(
             prompt=scene_text,
             n=n_candidates,
-            config=generation_config,
+            config=config,
         )
         candidate_images = [g.image for g in generated]
 

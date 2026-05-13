@@ -310,18 +310,17 @@ def run_pipeline_v2(
                 )
                 debug_control_img.save(scene_path / "control.png")
 
-            merged_gen: dict[str, Any] = {**generation_config, "controlnet": cn_cfg}
             generated = generate_images_controlled(
                 prompt=prompt,
                 layout=layout_for_control,
                 n=n_candidates,
-                config=merged_gen,
+                config=config,
             )
         else:
             generated = generate_images(
                 prompt=prompt,
                 n=n_candidates,
-                config=generation_config,
+                config=config,
             )
         candidate_images = [g.image for g in generated]
 

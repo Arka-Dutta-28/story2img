@@ -1,99 +1,112 @@
 """
 generator/image_generator.py
 -----------------------------
-Image generation module using Stable Diffusion XL (SDXL).
+Orchestration layer for image generation backends.
 
 Responsibilities
 ----------------
-- Load the SDXL pipeline once and reuse it across calls
-- Generate exactly N candidate images for a given prompt
-- Apply deterministic seeding per candidate (incremental or random)
-- Read all generation parameters from the config dict
-- Return a list of PIL Images with their metadata
+- Select the configured generation backend based on config
+- Manage backend lifecycle and pipeline reuse
+- Resolve seeds and assemble metadata for generated images
+- Provide unified interface across all backend types
+- Keep SDXL behavior compatible while supporting new backends
+
+Architecture role
+-----------------
+This module serves as the main entry point for image generation in the
+story2img pipeline. It abstracts away backend-specific details while
+providing consistent metadata handling and seed management across all
+supported backends (SDXL, FLUX, future backends).
 
 Public interface
 ----------------
     generate_images(prompt, n, config) -> List[GeneratedImage]
 
-No ControlNet. No reference images. No pipeline integration. No memory.
+Backend orchestration
+---------------------
+- Backend selection via config["generation"]["backend"]
+- Automatic backend caching and lifecycle management
+- Seed resolution with incremental/random strategies
+- Metadata assembly with backend-specific fields
+- Error handling and logging for generation failures
+
+Supported backends
+------------------
+- sdxl: SDXL with ControlNet support
+- flux: FLUX.1-dev with precision options
+- Extensible: New backends added via backend_factory registry
+
+Seed management
+---------------
+- incremental: Seeds start from base_seed and increment
+- random: Random seeds within uint32 range
+- Reproducible results with same seed across backends
 """
 
 import logging
 import random
-from dataclasses import dataclass, field
-from typing import Optional
+import time
+from typing import Any
 
-from PIL import Image
+from generator.backends.base import GeneratedImage
+from generator.backends.backend_factory import get_backend
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Output dataclass
-# ---------------------------------------------------------------------------
 
-@dataclass
-class GeneratedImage:
+def _extract_generation_config(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    One generated candidate image and its metadata.
+    Extract generation config from full config dict.
 
-    Attributes
+    Parameters
     ----------
-    image        : The PIL Image object.
-    seed         : The seed used to generate this image.
-    candidate_idx: 0-based index within the N candidates for this prompt.
-    prompt       : The prompt used (for logging/traceability).
-    steps        : Inference steps used.
-    guidance_scale: CFG guidance scale used.
-    width        : Image width in pixels.
-    height       : Image height in pixels.
+    config : dict[str, Any]
+        Input config that may contain 'generation' section.
+
+    Returns
+    -------
+    tuple[dict[str, Any], dict[str, Any]]
+        (generation_config, full_config) where generation_config
+        is the 'generation' section or the whole config if missing.
+
+    Notes
+    -----
+    Handles backward compatibility for configs without 'generation' section.
+    Used internally to separate generation-specific settings from global config.
     """
-    image:          Image.Image
-    seed:           int
-    candidate_idx:  int
-    prompt:         str
-    steps:          int
-    guidance_scale: float
-    width:          int
-    height:         int
+    if "generation" in config:
+        return config["generation"], config
+    return config, {"generation": config}
 
 
-# ---------------------------------------------------------------------------
-# Seed strategies
-# ---------------------------------------------------------------------------
-
-def _resolve_seeds(n: int, config: dict) -> list[int]:
+def _resolve_seeds(n: int, config: dict[str, Any]) -> list[int]:
     """
-    Produce ``n`` integer seeds according to ``config["seed_strategy"]``.
+    Generate list of seeds based on strategy and base seed.
 
     Parameters
     ----------
     n : int
-        Number of seeds required (length of returned list).
-    config : dict
-        Generation configuration; reads ``seed_strategy`` (default
-        ``"incremental"``) and ``base_seed`` (default ``42``).
+        Number of seeds to generate.
+    config : dict[str, Any]
+        Config containing seed_strategy and base_seed.
 
     Returns
     -------
     list[int]
-        ``n`` seeds: arithmetic progression for ``incremental``, or independent
-        draws for ``random``.
+        List of n seed values.
 
     Notes
     -----
-    ``incremental`` uses ``[base_seed + i for i in range(n)]``. ``random`` uses
-    ``random.randint(0, 2**32 - 1)`` per slot.
+    Supports 'incremental' and 'random' strategies. Incremental starts
+    from base_seed and increments by 1. Random generates values in
+    uint32 range for broad compatibility.
 
     Raises
     ------
     ValueError
-        If ``seed_strategy`` is neither ``incremental`` nor ``random``.
-
-    Edge cases
-    ----------
-    Unknown strategy strings raise with a message listing supported values.
+        If seed_strategy is not 'incremental' or 'random'.
     """
-    strategy  = config.get("seed_strategy", "incremental")
+    strategy = config.get("seed_strategy", "incremental")
     base_seed = int(config.get("base_seed", 42))
 
     if strategy == "incremental":
@@ -103,222 +116,134 @@ def _resolve_seeds(n: int, config: dict) -> list[int]:
         return [random.randint(0, 2**32 - 1) for _ in range(n)]
 
     raise ValueError(
-        f"Unknown seed_strategy: {strategy!r}. "
-        "Supported values: 'incremental', 'random'."
+        f"Unknown seed_strategy: {strategy!r}. Supported values: 'incremental', 'random'."
     )
 
-
-# ---------------------------------------------------------------------------
-# Pipeline loader (module-level singleton)
-# ---------------------------------------------------------------------------
-
-_pipeline = None          # cached pipeline instance
-_loaded_model_id: Optional[str] = None
-
-
-def _load_pipeline(model_id: str):
-    """
-    Return a module-singleton ``StableDiffusionXLPipeline`` for ``model_id``.
-
-    Parameters
-    ----------
-    model_id : str
-        Hugging Face model identifier for SDXL weights.
-
-    Returns
-    -------
-    StableDiffusionXLPipeline
-        Loaded or cached pipeline on ``cuda``, ``mps``, or ``cpu``.
-
-    Notes
-    -----
-    Reuses ``_pipeline`` when ``_loaded_model_id`` matches. Selects dtype
-    ``float16`` on GPU backends else ``float32`` on CPU. Attempts
-    ``enable_xformers_memory_efficient_attention`` when not on CPU.
-
-    Raises
-    ------
-    ImportError
-        If ``torch`` or ``diffusers`` import fails.
-
-    Edge cases
-    ----------
-    If xformers enable fails, logs at DEBUG and continues without it.
-    """
-    global _pipeline, _loaded_model_id
-
-    if _pipeline is not None and _loaded_model_id == model_id:
-        logger.debug("Reusing cached SDXL pipeline for %s", model_id)
-        return _pipeline
-
-    logger.info("Loading SDXL pipeline: %s", model_id)
-
-    try:
-        import torch
-        from diffusers import StableDiffusionXLPipeline
-    except ImportError as exc:
-        raise ImportError(
-            "Required packages not installed. Run:\n"
-            "  pip install diffusers transformers accelerate torch"
-        ) from exc
-
-    if torch.cuda.is_available():
-        device    = "cuda"
-        dtype     = torch.float16
-    elif torch.backends.mps.is_available():
-        device    = "mps"
-        dtype     = torch.float16
-    else:
-        device    = "cpu"
-        dtype     = torch.float32
-        logger.warning(
-            "No GPU detected — running SDXL on CPU. "
-            "Generation will be very slow. "
-            "Consider using 512x512 resolution and fewer steps."
-        )
-
-
-    logger.info("Using device=%s  dtype=%s", device, dtype)
-
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        use_safetensors=True,
-        variant="fp16" if dtype == torch.float16 else None,
-    )
-    pipe = pipe.to(device)
-
-    if device != "cpu":
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            logger.info("xformers memory-efficient attention enabled")
-        except Exception:
-            logger.debug("xformers not available; skipping")
-
-    _pipeline        = pipe
-    _loaded_model_id = model_id
-
-    logger.info("SDXL pipeline ready")
-    return _pipeline
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def generate_images(
     prompt: str,
     n: int,
-    config: dict,
+    config: dict[str, Any],
 ) -> list[GeneratedImage]:
     """
-    Generate ``n`` SDXL images for ``prompt`` using settings from ``config``.
+    Generate multiple images from prompt using configured backend.
+
+    This is the main entry point for image generation. It selects the
+    appropriate backend, manages pipeline lifecycle, resolves seeds,
+    and assembles comprehensive metadata for each generated image.
 
     Parameters
     ----------
     prompt : str
-        Text prompt; must be non-empty after stripping.
+        Text prompt describing the desired image.
     n : int
-        Candidate count; must be at least 1.
-    config : dict
-        Generation block: ``model_id`` (optional default), ``steps``,
-        ``guidance_scale``, ``height``, ``width``, and seed fields consumed by
-        ``_resolve_seeds``.
+        Number of images to generate (batch size).
+    config : dict[str, Any]
+        Configuration dictionary containing backend selection and parameters.
 
     Returns
     -------
     list[GeneratedImage]
-        One record per seed, preserving order, each wrapping ``output.images[0]``.
+        List of GeneratedImage objects with PIL images and metadata.
 
     Notes
     -----
-    Loads pipeline via ``_load_pipeline``, builds a ``torch.Generator`` per seed
-    on ``pipe.device.type``, calls ``pipe`` with ``num_images_per_prompt=1`` per
-    iteration.
+    Backend selection via config["generation"]["backend"] (default: "sdxl").
+    Supports SDXL and FLUX backends with automatic pipeline management.
+    Seeds resolved based on config seed_strategy. Each image gets unique
+    metadata including backend name, precision, and generation time.
 
     Raises
     ------
     ValueError
-        For empty prompt or invalid ``n``.
-    ImportError
-        If ``torch`` is missing after pipeline load.
+        If prompt is empty or n < 1.
     RuntimeError
-        If any ``pipe(...)`` call raises (re-raised with candidate index).
+        If backend generation fails.
 
     Edge cases
     ----------
-    Each failed pipeline call logs and raises; prior successful candidates are
-    discarded (function does not return partial results on error).
+    Single image generation (n=1) works normally.
+    Backend switching handled automatically with proper cleanup.
+    Config without 'generation' section uses whole config as generation config.
     """
     if not prompt or not prompt.strip():
         raise ValueError("prompt must be a non-empty string.")
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}.")
 
-    model_id       = config.get("model_id", "stabilityai/stable-diffusion-xl-base-1.0")
-    steps          = int(config.get("steps", 30))
-    guidance_scale = float(config.get("guidance_scale", 7.5))
-    height         = int(config.get("height", 768))
-    width          = int(config.get("width", 768))
+    generation_config, full_config = _extract_generation_config(config)
+    backend = get_backend(full_config)
+
+    backend_name = backend.backend_name
+    backend_block = full_config.get("backends", {}).get(backend_name, {})
+    model_id = generation_config.get("model_id") or backend_block.get("model_id")
+    precision = generation_config.get("precision") or backend_block.get("precision", "fp16")
+    quantized = bool(generation_config.get("quantized", backend_block.get("quantized", False)))
 
     logger.info(
-        "generate_images | n=%d  steps=%d  guidance=%.1f  %dx%d  model=%s",
-        n, steps, guidance_scale, width, height, model_id,
+        "generate_images | backend=%s model=%s precision=%s quantized=%s",
+        backend_name,
+        model_id,
+        precision,
+        quantized,
     )
 
-    seeds = _resolve_seeds(n, config)
+    steps = int(generation_config.get("steps", 30))
+    guidance_scale = float(generation_config.get("guidance_scale", 7.5))
+    height = int(generation_config.get("height", 768))
+    width = int(generation_config.get("width", 768))
+
+    logger.info(
+        "generate_images | n=%d steps=%d guidance=%.1f %dx%d",
+        n,
+        steps,
+        guidance_scale,
+        width,
+        height,
+    )
+
+    seeds = _resolve_seeds(n, generation_config)
     logger.info("Seeds for this call: %s", seeds)
 
-    pipe = _load_pipeline(model_id)
-
-    try:
-        import torch
-    except ImportError as exc:
-        raise ImportError("torch is required. Run: pip install torch") from exc
+    backend.load_pipeline()
+    logger.info("Selected backend=%s", backend_name)
 
     results: list[GeneratedImage] = []
-    logger.debug(f"[GENERATOR] Prompt: {prompt}")
+    logger.debug("[GENERATOR] Prompt: %s", prompt)
 
     for idx, seed in enumerate(seeds):
-        logger.info(
-            "Generating candidate %d/%d  seed=%d", idx + 1, n, seed
-        )
-
-        generator = torch.Generator(device=pipe.device.type).manual_seed(seed)
+        logger.info("Generating candidate %d/%d seed=%d", idx + 1, n, seed)
+        start = time.perf_counter()
 
         try:
-            output = pipe(
-                prompt=prompt,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                height=height,
-                width=width,
-                generator=generator,
-                num_images_per_prompt=1,
-            )
+            image = backend.generate(prompt=prompt, seed=seed, config=full_config)
         except Exception as exc:
             logger.error(
-                "Pipeline call failed for candidate %d (seed=%d): %s",
-                idx, seed, exc,
+                "Generation failed for candidate %d (seed=%d): %s",
+                idx,
+                seed,
+                exc,
             )
-            raise RuntimeError(
-                f"SDXL generation failed for candidate {idx} (seed={seed}): {exc}"
-            ) from exc
+            raise
 
-        pil_image = output.images[0]
-
-        results.append(GeneratedImage(
-            image          = pil_image,
-            seed           = seed,
-            candidate_idx  = idx,
-            prompt         = prompt,
-            steps          = steps,
-            guidance_scale = guidance_scale,
-            width          = width,
-            height         = height,
-        ))
-
-        logger.info("Candidate %d/%d done  seed=%d", idx + 1, n, seed)
+        elapsed = time.perf_counter() - start
+        results.append(
+            GeneratedImage(
+                image=image,
+                seed=seed,
+                candidate_idx=idx,
+                prompt=prompt,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                width=width,
+                height=height,
+                backend_name=backend_name,
+                precision=precision,
+                quantized=quantized,
+                generation_time=elapsed,
+            )
+        )
+        logger.info("Candidate %d/%d done seed=%d time=%.2fs", idx + 1, n, seed, elapsed)
 
     logger.info("generate_images complete | returned %d images", len(results))
     return results
