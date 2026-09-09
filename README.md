@@ -2,6 +2,19 @@
 
 A Python repository for automated story-to-image generation. Converts text narratives into illustrated sequences using multiple diffusion backends (SDXL, FLUX.1-dev) with optional layout-controlled generation via ControlNet. Integrates LLM-based story parsing, constraint-driven prompt building, OpenCLIP-based image evaluation, and per-character memory management.
 
+**Status: paused.** Work stopped in May 2026 when I was reassigned to other
+research. The pipeline runs end to end and there are per-component checks in
+`utils/`, but the evaluation numbers were written to `logs/` and `outputs/`,
+both gitignored, so no results are committed yet. The intended next step was
+scaling from the four fables in `data/test_stories/` to the 146 fables of
+[The AEsop for Children](https://read.gov/aesop/001.html), which is where
+cross-frame character consistency actually gets hard.
+
+There is a second copy of this project at `story-img`. This repository is the
+one that is ahead: it adds the whole `generator/backends/` layer (SDXL and
+FLUX backends behind a factory) that the other lacks. The one thing `story-img`
+had and this did not was entity grounding, which has now been ported across.
+
 ## Core Design
 
 The system follows a **modular orchestration architecture**:

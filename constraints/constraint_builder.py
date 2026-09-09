@@ -480,6 +480,112 @@ Output format:
 
 
 # --------------------------------------------------
+# Entity grounding (before prompt collapse)
+# --------------------------------------------------
+#
+# WHY. A bare story noun is ambiguous to a diffusion model: "mouse" sits
+# between the animal and the input device, "crow" between the bird and a
+# crowbar, and the model resolves it towards whatever its caption distribution
+# favours. Naming the thing before the prompt is built removes the ambiguity
+# without touching the model. Recovered from the story-img branch, where it was
+# written and then lost when this repo took a different path.
+#
+# ponytail: 12 hand-written entities, which covers the four fables in
+# data/test_stories/ and nothing else. The target corpus is the 146 fables of
+# read.gov's "The AEsop for Children", which introduce hundreds of distinct
+# animals and objects (stork, beetle, jackdaw, filberts, satyr, ...), so this
+# dict silently does nothing for 142 of them. Upgrade path: have the LLM parser
+# emit an already-grounded noun phrase per entity as part of scene parsing,
+# and keep this map only as a fallback for nouns it leaves ambiguous.
+
+_ENTITY_MAP: dict[str, str] = {
+    "mouse": "small gray mouse animal",
+    "lion": "adult male lion",
+    "fox": "red fox",
+    "crow": "black crow",
+    "dog": "shepherd dog",
+    "boy": "young shepherd boy",
+    "pot": "clay water pot",
+    "jug": "ceramic water jug",
+    "stones": "small pebbles",
+    "net": "rope net",
+    "grapes": "purple grape cluster",
+    "tree": "grapevine tree",
+}
+
+
+def _substitute_entity_words(text: str, entity_map: dict[str, str]) -> str:
+    """Replace whole words only, one pass, case-insensitive.
+
+    NOT idempotent. A replacement can contain its own key as a whole word
+    ("net" -> "rope net"), so a second pass expands again and yields
+    "rope rope net". Callers must apply this once per string; the sentinel in
+    ``normalize_entities`` enforces that at the dict level.
+    """
+    if not text or not entity_map:
+        return text
+    keys = sorted(entity_map.keys(), key=len, reverse=True)
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b",
+        re.IGNORECASE,
+    )
+
+    def repl(m: "re.Match[str]") -> str:
+        return entity_map[m.group(1).lower()]
+
+    return pattern.sub(repl, text)
+
+
+def normalize_entities(constraints: dict) -> dict:
+    """
+    Map ambiguous story nouns to clearer visual phrases in characters, actions,
+    setting and layout names. Mutates and returns ``constraints``.
+
+    Call after ``build_constraints`` and before ``compress_prompt`` /
+    ``build_prompt_from_constraints``.
+
+    Idempotent by sentinel: calling it twice on the same dict is a no-op. The
+    underlying substitution is not idempotent, so without this guard a second
+    call would turn "rope net" into "rope rope net".
+    """
+    if constraints.get("_entities_normalized"):
+        return constraints
+
+    entity_map = _ENTITY_MAP
+
+    for c in constraints.get("characters", []):
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name", "")
+        if not name:
+            continue
+        key = str(name).strip().lower()
+        if key in entity_map:
+            c["name"] = entity_map[key]
+
+    constraints["actions"] = [
+        _substitute_entity_words(str(act), entity_map)
+        for act in constraints.get("actions", [])
+    ]
+
+    if constraints.get("setting"):
+        constraints["setting"] = _substitute_entity_words(
+            str(constraints["setting"]), entity_map
+        )
+
+    layout = constraints.get("layout")
+    if isinstance(layout, dict):
+        for lc in layout.get("characters", []):
+            if isinstance(lc, dict) and lc.get("name"):
+                key = str(lc["name"]).strip().lower()
+                if key in entity_map:
+                    lc["name"] = entity_map[key]
+
+    constraints["_entities_normalized"] = True
+    return constraints
+
+
+# --------------------------------------------------
 # Structured constraints → prompt (preferred path)
 # --------------------------------------------------
 

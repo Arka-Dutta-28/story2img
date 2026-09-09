@@ -41,6 +41,7 @@ from constraints.constraint_builder import (
     build_prompt,
     build_prompt_from_constraints,
     compress_prompt,
+    normalize_entities,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,7 +235,9 @@ def run_pipeline_v2(
             prompt = cached_prompt_text
             if use_controlnet:
                 try:
-                    constraints = build_constraints(scene, char_descriptions, config)
+                    constraints = normalize_entities(
+                        build_constraints(scene, char_descriptions, config)
+                    )
                     if not str(prompt).strip():
                         raise ValueError("empty cached prompt")
                 except Exception as exc:
@@ -245,7 +248,9 @@ def run_pipeline_v2(
                 constraints = None
         else:
             try:
-                constraints = build_constraints(scene, char_descriptions, config)
+                constraints = normalize_entities(
+                    build_constraints(scene, char_descriptions, config)
+                )
                 if use_controlnet:
                     prompt = compress_prompt(constraints)
                     if len(prompt) > 200:

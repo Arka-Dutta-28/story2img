@@ -20,4 +20,3 @@ outputs/
 # Runtime caches (layout + text embeddings)
 cache/
 
-*.md

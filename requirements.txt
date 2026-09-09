@@ -74,7 +74,7 @@ open_clip_torch==3.3.0
 opencv-python==4.13.0.92
 opencv-python-headless==4.13.0.92
 orjson==3.11.7
-packaging @ file:///home/task_176104877067765/conda-bld/packaging_1761049113113/work
+packaging==25.0
 pandas==2.3.3
 pillow==12.1.1
 prettytable==3.17.0
