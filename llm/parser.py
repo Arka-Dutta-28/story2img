@@ -27,7 +27,14 @@ Output contract (strict)
             "setting": str,           # where / environment
             "characters_present": [str, ...],   # names only, subset of characters[]
             "mood": str,              # emotional tone
-            "time_of_day": str        # morning / afternoon / night / unknown
+            "time_of_day": str,       # morning / afternoon / night / unknown
+            "dialogue": [             # optional; [] when nobody speaks
+                {
+                    "speaker": str,   # exact name from characters[], or "narrator"
+                    "line": str       # what is said, without quote marks
+                },
+                ...
+            ]
         },
         ...
     ],
@@ -91,6 +98,15 @@ STRICT RULES:
 - Output EXACTLY N frames
 - Every frame must be visually filmable and image-generation-ready
 - If unsure, use "unknown" or empty list
+
+DIALOGUE AND PRONOUNS:
+- Extract spoken lines into each scene's dialogue[] in the order they are said
+- RESOLVE EVERY PRONOUN. "he", "she", "it", "they" must become the exact
+  character name from characters[]. Never output a pronoun as a speaker.
+- A line spoken by no character (narration, a moral, a caption) gets
+  speaker "narrator"
+- Strip surrounding quote marks from line
+- If a scene contains no speech, use an empty dialogue list
 """
 
 def _build_user_prompt(story: str) -> str:
@@ -134,6 +150,13 @@ IMPORTANT FOR DOWNSTREAM IMAGE GENERATION:
 - Avoid vague text like "something happens" or purely emotional statements
 - Prefer physically observable details
 
+IMPORTANT FOR SPEECH BALLOONS:
+- Put every spoken line in that scene's dialogue[], in spoken order
+- speaker MUST be an exact name from characters[], or "narrator"
+- Resolve pronouns to names: if the story says "he begged", and the beggar is
+  the Mouse, the speaker is "Mouse", not "he"
+- A scene with no speech has "dialogue": []
+
 Return a JSON object with EXACTLY this structure:
 
 {{
@@ -150,7 +173,13 @@ Return a JSON object with EXACTLY this structure:
       "setting": "<location + environment details>",
       "characters_present": ["<name>", "..."],
       "mood": "<emotional tone>",
-      "time_of_day": "<morning | afternoon | evening | night | unknown>"
+      "time_of_day": "<morning | afternoon | evening | night | unknown>",
+      "dialogue": [
+        {{
+          "speaker": "<exact name from characters[], or narrator>",
+          "line": "<what is said, no quote marks>"
+        }}
+      ]
     }}
   ],
   "style": "<overall visual style inferred from the story>"
@@ -290,6 +319,24 @@ def _validate(data: dict[str, Any]) -> list[str]:
                 for field in required_scene_fields:
                     if field not in s:
                         errors.append(f"scenes[{i}] missing '{field}'")
+
+                # dialogue is OPTIONAL on purpose. Requiring it would invalidate
+                # every previously cached parser log under logs/parser/, which the
+                # sanity checks read. Shape is enforced when the key is present.
+                if "dialogue" in s:
+                    d = s["dialogue"]
+                    if not isinstance(d, list):
+                        errors.append(f"scenes[{i}]['dialogue'] must be a list")
+                    else:
+                        for j, turn in enumerate(d):
+                            if not isinstance(turn, dict):
+                                errors.append(f"scenes[{i}].dialogue[{j}] must be a dict")
+                                continue
+                            for f2 in ("speaker", "line"):
+                                if not isinstance(turn.get(f2), str) or not turn[f2].strip():
+                                    errors.append(
+                                        f"scenes[{i}].dialogue[{j}] needs a non-empty '{f2}'"
+                                    )
 
     if "style" not in data:
         errors.append("Missing key: 'style'")
